@@ -211,8 +211,10 @@ open this in a second tab: http://localhost:8001/
 ```
 
 `demo-net.js` is the same path without the disk, for when only the network is
-of interest. In the app itself there is a **Serve** panel that does the same to
-the machine the page booted, once its disk is mounted.
+of interest. In the app itself there is a **Serve** panel that does the same to the machine
+the page booted. It stays disabled until the disk is mounted, and says so:
+the web server and the site both live on that disk, so Connect and Boot are not
+enough on their own. Mount, then Serve.
 
 ### Driving it from inside the machine
 

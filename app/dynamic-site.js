@@ -17,6 +17,21 @@
 
 import { rc } from "../src/guest/fs.js";
 
+/**
+ * The two assets, which exist to answer one question: did they load?
+ *
+ * A machine on an origin of its own loads both; one sharing the app's origin
+ * loads the document and nothing else. The form keeps working either way,
+ * because a form submission is a navigation.
+ */
+export const ASSETS = {
+  "style.css": "h1{color:#14685A}@media(prefers-color-scheme:dark){h1{color:#55C4A6}}",
+  "app.js":
+    'document.getElementById("probe").textContent = ' +
+    '"Served by busybox httpd from the machine\u2019s disk. The stylesheet and the ' +
+    'script both loaded, so this machine has an origin of its own.";'
+};
+
 /** Written to the served directory. The CGI is the only one made executable. */
 export const CGI = "cgi-bin/process.cgi";
 
@@ -131,6 +146,11 @@ export async function install(run, { directory, timeoutMs = 40000 } = {}) {
   // instead would put a fifteen-hundred-character line in it, and a line is the
   // unit a command is cut into: no amount of splitting the script by lines makes
   // one long line short enough to survive the guest talking over it.
+  for (const [name, body] of Object.entries(ASSETS)) {
+    const asset = await rc(run, `printf '%s' '${quote(body)}' > ${directory}/${name}`, timeoutMs);
+    if (!asset.ok) throw new Error(`could not write ${directory}/${name}`);
+  }
+
   const stylePath = `${directory}/inline.css`;
   for (let at = 0; at < STYLE.length; at += 180) {
     const piece = STYLE.slice(at, at + 180);

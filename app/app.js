@@ -16,6 +16,7 @@ import * as fsModule from "../src/guest/fs.js";
 import * as alpineModule from "../src/guest/alpine.js";
 import { makeRunner } from "../src/guest/runner.js";
 import { resilient, restoreRuntimeState, serveMachine, stageFiles } from "./serve-machine.js";
+import * as dynamicSite from "./dynamic-site.js";
 import { keyToBytes, textToBytes, pasteNeedsConfirming } from "../src/ui/keyboard.js";
 
 const V86_ROOT = "../spike-c";
@@ -369,7 +370,13 @@ function setMounted(on) {
   $("install").disabled = !on;
   $("installBtn").disabled = !on || !$("install").files.length;
   // Serving needs the same: the web server and the site both live on the disk.
+  // Saying why is the difference between a disabled button and a mystery.
   $("serveBtn").disabled = !on;
+  if (!serving) {
+    serveStatus(on
+      ? "Ready. Serve puts a web server on the disk and gives the machine a URL."
+      : "Mount the disk first — the web server and the site both live on it.");
+  }
   $("alpine").disabled = !on || !!state.alpine;
   if (!on) { $("packages").disabled = true; $("packagesBtn").disabled = true; }
 }
@@ -848,13 +855,18 @@ $("serveBtn").addEventListener("click", async () => {
     const staged = await stageFiles(state.emulator, terminal);
     log(`handed to the guest: busybox (${staged.bytes} bytes) and rrd`);
 
-    // A directory to serve, so the first press of this button shows something.
+    // The same site the demo serves, and only when the directory has no page of
+    // its own: a machine that already holds somebody's site must not have it
+    // overwritten by a demonstration of what a site is.
     await guestRunResilient(`mkdir -p ${directory}`);
-    await guestRunResilient(
-      `[ -f ${directory}/index.html ] || printf '%s' ` +
-      `'<!doctype html><title>This machine</title><h1>Served from inside the VM</h1>' ` +
-      `> ${directory}/index.html`
-    );
+    const present = await guestRunResilient(`test -f ${directory}/index.html; echo rc=$?`,
+      { until: (tail) => /rc=\d/.test(tail) });
+    if (!/rc=0/.test(present)) {
+      await dynamicSite.install(guestRunResilient, { directory });
+      log(`wrote a demonstration site to ${directory}, form and all`);
+    } else {
+      log(`${directory} already holds an index.html; serving what is there`);
+    }
 
     serving = await serveMachine({
       emulator: state.emulator,

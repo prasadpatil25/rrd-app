@@ -41,24 +41,6 @@ const CHUNK_SIZE = 256 * 1024;
 const PROMPT = /[#$%>]\s*$/;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/**
- * The two assets, which exist to answer one question: did they load?
- *
- * The page itself comes from dynamic-site.js, and is written last so it can link
- * these. Between them they show what each arrangement costs -- a machine on an
- * origin of its own loads all of it; one sharing the app's origin loads the
- * document and nothing else -- while the form on that page keeps working either
- * way, because a form submission is a navigation.
- */
-const ASSETS = {
-  "style.css":
-    "h1{color:#14685A}@media(prefers-color-scheme:dark){h1{color:#55C4A6}}",
-  "app.js":
-    'document.getElementById("probe").textContent = ' +
-    '"Served by busybox httpd from the machine\u2019s disk. The stylesheet and the ' +
-    'script both loaded, so this machine has an origin of its own.";'
-};
-
 export async function main({
   machine = "1", branch = null, machinePort = null, onStep = console.log
 } = {}) {
@@ -101,8 +83,15 @@ export async function main({
   });
   emulator.add_listener("serial0-output-byte", (b) => terminal.writeByte(b));
 
+  // The flush goes over the same console everything else does, and the guest
+  // talks over it. One repeat is the difference between a sync that fails and a
+  // sync that happened.
+  const flushOnce = serialFlush(emulator, { prompt: PROMPT });
   const device = new V86Device({
-    emulator, diskSize: DISK_SIZE, flush: serialFlush(emulator, { prompt: PROMPT })
+    emulator, diskSize: DISK_SIZE,
+    flush: async () => {
+      try { await flushOnce(); } catch { await flushOnce(); }
+    }
   });
   await device.waitForDevice(60000);
 
@@ -148,13 +137,8 @@ export async function main({
   const opened = await fs.open(run, { allowFormat: !attached.existing });
   log(`disk ${opened.formatted ? "formatted and " : ""}mounted at ${fs.MOUNTPOINT}`);
 
-  await rc(run, `mkdir -p ${SITE}`);
-  for (const [name, body] of Object.entries(ASSETS)) {
-    const written = await rc(run, `printf '%s' '${shellQuote(body)}' > ${SITE}/${name}`);
-    if (!written.ok) throw new Error(`could not write ${name} onto the disk`);
-  }
-  const site = await dynamicSite.install(run, { directory: SITE });
-  log(`wrote ${Object.keys(ASSETS).join(", ")}, index.html and ${dynamicSite.CGI} to ${SITE}`);
+  await dynamicSite.install(run, { directory: SITE });
+  log(`wrote the site to ${SITE}: index.html, ${dynamicSite.CGI} and its assets`);
 
   const serving = await serveMachine({
     emulator, run, device, engine, branch: onBranch, machine,
@@ -164,7 +148,7 @@ export async function main({
   // Straight through the stack, before any service worker is involved. All
   // three files, because a site is not one document.
   const fetched = {};
-  for (const name of ["", ...Object.keys(ASSETS), `${dynamicSite.CGI}?text=hello&calc=6*7`]) {
+  for (const name of ["", ...Object.keys(dynamicSite.ASSETS), `${dynamicSite.CGI}?text=hello&calc=6*7`]) {
     const path = `/${name}`;
     // A probe that fails is worth reporting, not worth abandoning a working
     // machine over: everything up to here is already running.
@@ -177,8 +161,16 @@ export async function main({
     log(`direct ${path} -> ${fetched[path]}`);
   }
 
-  const synced = await engine.sync({ message: "a machine that serves a site" });
-  log(`synced: ${synced.chunks} chunks dirty, ${synced.uploaded} uploaded, commit ${synced.commit}`);
+  // Worth doing, not worth losing a running machine over. Everything above is
+  // already serving; a sync that could not flush can be repeated by hand, and
+  // "rrd sync" inside the machine does exactly that.
+  try {
+    const synced = await engine.sync({ message: "a machine that serves a site" });
+    log(`synced: ${synced.chunks} chunks dirty, ${synced.uploaded} uploaded, commit ${synced.commit}`);
+  } catch (err) {
+    log(`the first sync did not finish (${err.message.split(".")[0]}); the machine is ` +
+        `serving regardless, and "rrd sync" will try again`);
+  }
   log(`open this in a second tab: ${serving.url}`);
 
   return {
