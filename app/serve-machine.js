@@ -71,7 +71,7 @@ export async function stageFiles(emulator, terminal, { busybox = BUSYBOX } = {})
  * @param {(message: string) => void} [options.onStep]
  */
 export async function serveMachine({
-  emulator, run, device, engine, branch,
+  emulator, run, device, engine, branch, lease = null,
   machine = "1", directory = SITE, machinePort = null,
   publishHost = null, publishBranch = null,
   net = null, onStep = () => {}
@@ -260,6 +260,7 @@ export async function serveMachine({
     actions: {
       status: async () => ({
         last: lastRun,
+        lease: lease ? await lease.read().catch(() => null) : null,
         serving: !!running.directory,
         directory: running.directory,
         port: running.port,

@@ -7,6 +7,7 @@
 
 import { createHost } from "../src/host/index.js";
 import { Machine, restore, ConflictError } from "../src/core/machine.js";
+import { Lease, holderName } from "../src/core/lease.js";
 import { V86Device, serialFlush } from "../src/device/v86.js";
 import { Governor } from "../src/core/governor.js";
 import { deriveCipher, randomSaltHex } from "../src/core/crypto.js";
@@ -60,7 +61,8 @@ function diskFor(base, diskSize, baseIsBlank) {
 const $ = (id) => document.getElementById(id);
 const state = {
   host: null, device: null, machine: null, emulator: null,
-  governor: null, cipher: null, booted: false, mounted: false, alpine: null
+  governor: null, cipher: null, booted: false, mounted: false, alpine: null,
+  lease: null, renewing: null
 };
 
 // --- output ------------------------------------------------------------------
@@ -225,9 +227,13 @@ $("boot").addEventListener("click", async () => {
     // Attach the engine before arming capture. Putting the machine back is a
     // write to the disk, and if capture were already on it would be recorded as
     // the guest's work and re-uploaded on the next sync.
+    // One writer at a time. Conflict retry below settles two writes that meet;
+    // it cannot settle two tabs that each believe they own this machine, and on
+    // GitHub a fast-forward-only reference update is what decides between them.
+    state.lease = new Lease({ host: state.host, branch, holder: holderName() });
     state.machine = new Machine({
       host: state.host, device: state.device, branch,
-      cipher: state.cipher, governor: state.governor,
+      cipher: state.cipher, governor: state.governor, lease: state.lease,
       onEvent: (e) => {
         if (e.type === "conflict-detected") log("another writer moved the branch first", "warn");
         if (e.type === "conflict-rebased") log(`rebased onto their commit; ${e.disjointChunks} chunks were disjoint`, "ok");
@@ -236,6 +242,28 @@ $("boot").addEventListener("click", async () => {
     const { existing } = await state.machine.load({
       diskSize, chunkSize, base, baseIsBlank: true
     });
+
+    // Taken once the branch is known, and kept alive while this tab is. A lease
+    // held by a tab that has gone away expires on its own, which is why it is a
+    // lease: a lock nobody can release is worse than no lock.
+    try {
+      const taken = await state.lease.acquire();
+      log(`lease on ${branch} held by ${taken.holder}` +
+          (taken.enforced ? "" : ", advisory only: this host has no compare-and-swap"),
+          taken.enforced ? "ok" : "warn");
+      state.renewing = setInterval(
+        () => state.lease.renew().catch((err) => log(`lease: ${err.message}`, "warn")),
+        4 * 60 * 1000
+      );
+      addEventListener("pagehide", () => {
+        if (state.lease) state.lease.release().catch(() => {});
+      }, { once: true });
+    } catch (err) {
+      // Somebody else has it. Booting is still fine -- looking at a machine is
+      // not writing to it -- but syncing will refuse until they let go.
+      log(err.message, "bad");
+      log("this tab can run the machine, but cannot sync it while somebody else holds it", "warn");
+    }
 
     if (existing) {
       // The device was built from the base image, so it is blank. Without this
@@ -786,9 +814,10 @@ $("restoreBtn").addEventListener("click", async () => {
       onEvent: (e) => log(`device ${e.type}: ${e.path} (${e.streamed ? "streamed" : "in memory"})`)
     });
     await state.device.waitForDevice(30000);
+    state.lease = new Lease({ host: state.host, branch, holder: holderName() });
     state.machine = new Machine({
       host: state.host, device: state.device, branch,
-      cipher: state.cipher, governor: state.governor
+      cipher: state.cipher, governor: state.governor, lease: state.lease
     });
     await state.machine.load();
     // The disk was built from this very state, so it is already put back.

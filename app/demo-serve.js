@@ -21,6 +21,7 @@
 // Then open m.url in a second tab. To stop:  await m.stop();
 
 import { Machine } from "../src/core/machine.js";
+import { Lease, holderName } from "../src/core/lease.js";
 import { V86Device, serialFlush } from "../src/device/v86.js";
 import { Governor } from "../src/core/governor.js";
 import { Terminal } from "../src/ui/terminal.js";
@@ -81,10 +82,18 @@ export async function main({
   });
   await device.waitForDevice(60000);
 
+  // One writer. The demo has only one tab, so this never refuses anything here
+  // -- which is the point of taking it anyway: the path a second tab would meet
+  // is the path this one walks.
+  const lease = new Lease({ host: gitHost, branch: onBranch, holder: holderName() });
   const engine = new Machine({
-    host: gitHost, device, branch: onBranch,
+    host: gitHost, device, branch: onBranch, lease,
     governor: new Governor({ ratePerMin: 6e6, concurrency: 8 })
   });
+  const taken = await lease.acquire();
+  log(`lease on ${onBranch} held by ${taken.holder}` +
+      (taken.enforced ? "" : ", advisory only: this host has no compare-and-swap"));
+  const renewing = setInterval(() => lease.renew().catch(() => {}), 4 * 60 * 1000);
   const attached = await engine.load({
     diskSize: DISK_SIZE, chunkSize: CHUNK_SIZE, base: BASE, baseIsBlank: true
   });
@@ -126,7 +135,7 @@ export async function main({
   log(`wrote the site to ${SITE}: index.html, ${dynamicSite.CGI} and its assets`);
 
   const serving = await serveMachine({
-    emulator, run, device, engine, branch: onBranch, machine,
+    emulator, run, device, engine, branch: onBranch, machine, lease,
     machinePort: onPort, net, directory: SITE, onStep: log
   });
 
@@ -160,10 +169,12 @@ export async function main({
 
   return {
     emulator, device, net, engine, host: gitHost, branch: onBranch,
-    run, steps, fetched, control: serving.control, url: serving.url,
+    run, steps, fetched, lease, control: serving.control, url: serving.url,
     sandboxed: serving.sandboxed,
     async stop() {
       detachKeyboard();
+      clearInterval(renewing);
+      await lease.release().catch(() => {});
       await serving.stop();
       net.detach();
       device.detach();

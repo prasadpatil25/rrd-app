@@ -50,6 +50,9 @@ export function startControl({ net, actions, port = 80, onEvent = () => {} }) {
         ["disk", status.disk || "-"],
         ["unsaved", status.dirty === undefined ? "-" : `${status.dirty} chunks`],
         ["branch", status.branch || "-"],
+        ["lease", status.lease
+          ? `${status.lease.holder}${status.lease.enforced ? "" : " (advisory)"}`
+          : "none"],
         ...last
       ]);
     },

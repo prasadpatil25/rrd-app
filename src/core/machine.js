@@ -29,9 +29,10 @@ export class Machine {
    * @param {Governor} [options.governor]
    * @param {(event: Object) => void} [options.onEvent]
    */
-  constructor({ host, device, branch, cipher, governor, onEvent }) {
+  constructor({ host, device, branch, cipher, governor, lease, onEvent }) {
     this.host = host;
     this.device = device;
+    this.lease = lease || null;
     this.branch = branch;
     this.cipher = cipher || plaintextCipher;
     this.governor = governor || new Governor();
@@ -191,6 +192,12 @@ export class Machine {
   async sync({ message, retryOnConflict = true } = {}) {
     const started = Date.now();
     const requestsBefore = this.host.requestCount;
+
+    // A machine that is held is held by one writer. Conflict retry below settles
+    // two writes that meet; it cannot settle two tabs that each believe they own
+    // this machine, because both of their commits are correct and only one of
+    // their disks is. Optional: a machine with no lease behaves as it always did.
+    if (this.lease) await this.lease.assertHeld();
 
     // Committing from a device that was never hydrated would write blank-derived
     // chunks over a real machine, while the manifest kept the old ids for every

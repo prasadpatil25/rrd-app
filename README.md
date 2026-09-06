@@ -76,7 +76,7 @@ claims.
 |---|---|---|
 | Restore cost is the live set plus three requests, constant in history | `node src/analysis/restore-scaling.mjs` | no |
 | Write amplification and the chunk-size trade-off | `node src/analysis/report.mjs traces/mke2fs-256mb.json` | no |
-| Every invariant the design rests on (809 tests, 14 suites) | see below | no |
+| Every invariant the design rests on (858 tests, 15 suites) | see below | no |
 | GitHub costs 20x the requests and 13x the time of a batch-commit host | `node src/analysis/batch-commit.mjs github <owner/repo>` then `gitlab` | **yes** |
 | Whether a batch-commit host offers a compare-and-swap | `node src/analysis/cas-probe.mjs gitlab <owner/repo>` | **yes** |
 
@@ -94,12 +94,12 @@ disk, not a synthetic workload.
 ```
 for t in test test-engine test-device test-fs test-runner test-terminal \
          test-keyboard test-alpine test-sweep test-bisect test-nbd test-batch \
-         test-net test-publish; do
+         test-net test-publish test-lease; do
   node src/$t.mjs
 done
 ```
 
-809 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
+858 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
 the client half of the NBD protocol over a real socket, so the wire format and
 the server loop are exercised rather than mocked; the one hop that needs Linux
 is `nbd-client` binding the export to `/dev/nbd0`. `test-net.mjs` does the same
@@ -350,6 +350,38 @@ which is a confusing way to be told a shell script printed a newline. And `rev`
 is not in this busybox, which is not an error -- just a column that came back
 empty.
 
+## One writer at a time
+
+Conflict retry settles two writes that meet: one lands, the other rebuilds on top
+of it. It cannot settle two tabs that each believe they own a machine. Each has
+its own device, its own dirty set and its own idea of what the disk holds;
+whichever syncs second rebuilds a manifest from a device that never saw the
+first one's writes, and that work is gone. Retrying is the wrong tool, because
+nothing went wrong -- both commits were correct, and only one of the disks was.
+
+So a machine is held. The holder is recorded on `<branch>-lease`, and the thing
+that makes that a lock rather than a note is the host: a fast-forward-only
+reference update rejects a second writer who started from the same commit. That
+is the compare-and-swap `casRef` reports, and `cas-probe.mjs` is what established
+which hosts have it -- GitHub does, GitLab and Forgejo do not. Where it is
+absent the lease still records who holds a machine and still refuses the obvious
+collisions; it says `advisory` rather than implying a guarantee the host will not
+make.
+
+It expires, because a browser tab can close without warning and a lock nobody can
+release is worse than none. Ten minutes by default, renewed every four while a
+tab lives, released on the way out. Taking an expired lease is allowed and is
+arbitrated by the same compare-and-swap, so two tabs reclaiming an abandoned
+machine cannot both win.
+
+`Machine` takes one as an option, and `sync()` refuses without it:
+
+    served-mtpy4h2j is held by tab-ixivzp for another 584s. Syncing from here
+    would commit a disk that never saw their writes.
+
+From inside the machine, `rrd status` shows who has it. The engine behaves
+exactly as it always did when no lease is passed.
+
 ## Publishing a site to a static host
 
 Serving a machine reaches other tabs in one browser. Publishing reaches everyone,
@@ -509,6 +541,7 @@ src/guest/      driving a guest shell: exit codes, mounts, Alpine, apk
 guest/          the machine's kernel and initramfs, and the script that builds it
 src/net/        the tab's TCP/IP stack: wire format, connections, HTTP
 src/core/publish.js  the publish lane: a site as a tree, on a ref of its own
+src/core/lease.js    one writer at a time, on a ref of its own
 net-sw.js       the worker that serves a machine, at the root so it can claim it
 app/control.js  the control plane the guest talks to; src/guest/control.js is its client
 src/ui/         terminal renderer and keyboard mapping
