@@ -76,6 +76,7 @@ claims.
 |---|---|---|
 | Restore cost is the live set plus three requests, constant in history | `node src/analysis/restore-scaling.mjs` | no |
 | Write amplification and the chunk-size trade-off | `node src/analysis/report.mjs traces/mke2fs-256mb.json` | no |
+| What a publish costs, and how it scales | `node src/analysis/publish-cost.mjs` | no |
 | Every invariant the design rests on (858 tests, 15 suites) | see below | no |
 | GitHub costs 20x the requests and 13x the time of a batch-commit host | `node src/analysis/batch-commit.mjs github <owner/repo>` then `gitlab` | **yes** |
 | Whether a batch-commit host offers a compare-and-swap | `node src/analysis/cas-probe.mjs gitlab <owner/repo>` | **yes** |
@@ -349,6 +350,57 @@ that as "the guest closed the connection before sending a complete response",
 which is a confusing way to be told a shell script printed a newline. And `rev`
 is not in this busybox, which is not an error -- just a column that came back
 empty.
+
+## What the network and serving lanes cost
+
+The rest of this repository reports numbers; these lanes arrived with correctness
+tests and none. Measured on one machine, Chrome on Windows, v86 in a tab.
+
+**A publish.** Counted in process, so no network and no credentials:
+
+    files   site KB   req first   req steady   wire KB   inflation
+        1       0.5           6            5       0.7   1.46x
+       10       7.1          15           14      10.1   1.42x
+      100      73.4         105          104     104.1   1.42x
+      250     184.1         255          254     261.2   1.42x
+
+Steady state is one request per file plus four: a blob each, then the tree, the
+commit, the reference, and the read that found the parent. A repository with no
+commits costs one more the first time, because it has to be seeded before the git
+data API will accept anything. Base64 inflates the wire by 1.42x. On a
+batch-commit host the same publish is **one** request and meets a body limit
+instead -- the trade the disk lane already reports.
+
+**A request, forty times.** Through the stack, to the guest's own web server:
+
+                    min    median   p95
+    static file     5.7ms   9.4ms   13.4ms
+    CGI script    137.6ms  195.8ms  335.4ms
+
+The gap is not the network. A static file is the guest reading its disk; the CGI
+is the guest forking a shell and running a program, and that fork is twenty times
+the cost of the transport underneath it. Being dynamic is what costs, not being
+in a browser.
+
+**The service worker hop is free.** The same file, fetched from a tab that is not
+hosting the machine, so the request crosses the worker, the bridge iframe and a
+postMessage in each direction:
+
+    direct through the stack   median  9.4ms
+    through the worker         median  9.5ms
+
+**Throughput.** 4 MB from the guest's disk through the stack: 1.28 s, **3.12
+MB/s**, bytes intact. Across the whole measurement -- 92 connections -- zero
+retransmissions and zero resets.
+
+**Boot.** 5.7 s from the emulator starting to a shell; about 20 s from opening
+`/app/?serve` to a machine that is serving, most of which is fetching the kernel
+and the initramfs over HTTP.
+
+One measurement is deliberately absent. There is no comparison against a
+WebSocket relay, because there is no relay in this project to compare against,
+and building one to lose a race to would be a benchmark written to its
+conclusion. The breakdown above is the part a reader can act on.
 
 ## One writer at a time
 
