@@ -236,22 +236,36 @@ part of the machine -- restore that machine elsewhere and its commands come back
 with it. It is a shell script over `wget`, so `wget -qO- http://10.0.2.2/status`
 does the same thing if the shell's PATH has been reset.
 
-**Expect to reload the other tab once.** The retry described below can take the
-guest's server down between the moment a machine starts serving and the moment
-another tab asks it for something. The hosting tab puts it back -- one repair
-however many requests noticed it -- but a page already loading gets a 503 saying
-to reload, and the reload works. Measured on a fresh boot: the first load asked
-too early, the second returned the document, the third returned the document and
-both its assets.
+**Expect to reload the other tab once**, on its first visit: a service worker
+does not control the navigation that installs it, so the first load of a machine
+URL arrives before there is anything to answer it.
 
-**One thing to know about this guest.** The vendored image retries its 9p mount
-for as long as it runs, and each attempt prints two lines onto the same serial
-console commands travel over. Landing mid-command, that text cuts the line in
-half -- and the retry takes the machine's mount point, its address and its
-running server with it. The demo bounds every command, presses Ctrl-C, puts the
-disk, the network and the server back, and repeats the line; `serve-machine.js`
-says so where it does it. A guest image that does not do this would need none of
-that.
+**The guest is ours now.** A machine boots a kernel and an initramfs rather than
+a CD carrying somebody else's userland, and `guest/` holds both: `init`, one
+static busybox, and `build.mjs`, which is a cpio archive and a gzip and nothing
+else -- no toolchain, no buildroot.
+
+It exists because the ISO's userland fought the tab it ran in: it retried its 9p
+mount for as long as it ran, and each attempt printed into the one channel
+commands travel over and took the mount point, the guest's address and any
+running server with it. Around seventy lines of this repository were written to
+survive that -- a bounded runner, a state restorer, a self-healing serve path --
+and have since been deleted. Measured over a full run on the new image: no
+recoveries, no restarts, no resets, and 0 retransmits across 17 connections.
+
+What it brings, on a boot:
+
+    shell           about 4 seconds
+    /mnt            9p mounted once, no retry
+    eth0            10.0.2.15/24, addressed before anything asks
+    lo              up, so a server can check itself
+    /dev/sda        present
+    busybox         402 applets, httpd among them
+
+The last line matters more than it looks: a machine no longer has to have a web
+server smuggled onto it before it can serve anything.
+
+    node guest/build.mjs        rebuild the initramfs after editing guest/init
 
 The guest is at 10.0.2.15 and the tab is at 10.0.2.2, which are v86's usual
 addresses, so an image configured for the usual setup needs no change. A machine
@@ -469,6 +483,7 @@ src/core/       the sync engine: chunker, manifest, governor, machine, bisect
 src/device/     the five-operation device contract, and its three implementations
 src/host/       GitHub, GitLab and Forgejo adapters behind one interface
 src/guest/      driving a guest shell: exit codes, mounts, Alpine, apk
+guest/          the machine's kernel and initramfs, and the script that builds it
 src/net/        the tab's TCP/IP stack: wire format, connections, HTTP
 src/core/publish.js  the publish lane: a site as a tree, on a ref of its own
 net-sw.js       the worker that serves a machine, at the root so it can claim it

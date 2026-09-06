@@ -37,6 +37,36 @@ rather than trusting the file:
     sha256sum -c vendor/alpine/alpine-minirootfs-3.20.10-x86.tar.gz.sha256
 
 
+guest/
+------
+
+A Linux kernel and an initramfs built from parts already in this repository.
+
+    bzimage-linux4.bin     Linux 4.16.13, GPL-2.0
+    initramfs.cpio.gz      built by guest/build.mjs from guest/init and
+                           vendor/busybox/busybox-1.35.0-i686
+
+The kernel is not new material: it is the one inside
+spike-c/images/linux4.iso, extracted rather than rebuilt, and it is v86's own
+buildroot kernel. **The Linux kernel is GPL-2.0, and section 3 requires its
+source to be available to anyone who receives the binary.** That source is the
+4.16.13 release from https://kernel.org, with v86's buildroot configuration at
+https://github.com/copy/v86; the ISO it came out of is committed beside it and
+carries the same obligation, extraction or not.
+
+The initramfs is ours except for the busybox inside it, which keeps the licence
+recorded under vendor/busybox/. Rebuild it with:
+
+    node guest/build.mjs
+
+Why it exists. The userland inside that ISO retries its 9p mount for as long as
+it runs, and each attempt prints into the one channel commands travel over and
+takes the disk, the guest's address and any running server down with it. Roughly
+seventy lines of this repository were written to survive that and have since been
+deleted. This initramfs mounts the share once, addresses the card at boot, and
+then leaves the machine alone.
+
+
 vendor/busybox/
 ---------------
 

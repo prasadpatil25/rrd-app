@@ -1,0 +1,60 @@
+#!/bin/busybox sh
+#
+# The whole of this machine's userland.
+#
+# It exists because the image this project used to boot fought the tab it runs
+# in: it retried its 9p mount for as long as it ran, and every attempt printed
+# into the one channel commands travel over and took the disk, the address and
+# any running server down with it. Roughly half the code in the network and
+# serving lanes was written to survive that.
+#
+# So: mount once, say nothing, and never retry. What cannot be mounted is not
+# mounted, and the shell starts either way.
+
+/bin/busybox --install -s /bin
+
+mount -t proc     proc     /proc
+mount -t sysfs    sysfs    /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+
+mkdir -p /mnt /disk /tmp /root
+mount -t tmpfs tmpfs /tmp
+
+# The share the browser passes files through. Once. A failure here is a machine
+# with no share, which is a machine that still works.
+mount -t 9p -o trans=virtio,version=9p2000.L host9p /mnt 2>/dev/null ||
+  mount -t 9p -o trans=virtio host9p /mnt 2>/dev/null
+
+# Loopback, so anything in here can talk to itself -- a server checking whether
+# it is up, for instance. Without it that check hangs rather than failing.
+ip link set lo up 2>/dev/null
+
+# The card the tab is on the other end of. Addressed here rather than left to
+# whoever boots it, because both ends of this link are known before it exists.
+ip link set eth0 up 2>/dev/null
+ip addr add 10.0.2.15/24 dev eth0 2>/dev/null
+ip route add default via 10.0.2.2 2>/dev/null
+
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/disk/usr/local/bin
+export HOME=/root
+export PS1='~% '
+
+# A moment before announcing anything. The kernel is still bringing devices up
+# and printing about it, and a banner that arrives first ends up with kernel
+# chatter underneath it -- which leaves a caller watching for a prompt looking at
+# a line about a mouse.
+sleep 1
+
+# To the serial line, not to the console. The console is the screen; the serial
+# line is where the tab is listening, and a caller deciding whether a shell is
+# ready needs to have seen a line end before the prompt -- otherwise the first
+# thing it ever sees is a prompt with nothing above it, which is indistinguishable
+# from a command echoed halfway.
+{
+  echo
+  echo "repo as root disk"
+  echo "  9p on /mnt, disk at /dev/sda, eth0 is 10.0.2.15, gateway 10.0.2.2"
+  echo
+} > /dev/ttyS0 2>&1
+
+exec setsid sh -c 'exec sh </dev/ttyS0 >/dev/ttyS0 2>&1'

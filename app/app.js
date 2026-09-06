@@ -15,7 +15,8 @@ import { Terminal } from "../src/ui/terminal.js";
 import * as fsModule from "../src/guest/fs.js";
 import * as alpineModule from "../src/guest/alpine.js";
 import { makeRunner } from "../src/guest/runner.js";
-import { resilient, restoreRuntimeState, serveMachine, stageFiles } from "./serve-machine.js";
+import { serveMachine, stageFiles } from "./serve-machine.js";
+import { bootOptions } from "./guest-image.js";
 import * as dynamicSite from "./dynamic-site.js";
 import { keyToBytes, textToBytes, pasteNeedsConfirming } from "../src/ui/keyboard.js";
 
@@ -207,21 +208,8 @@ $("boot").addEventListener("click", async () => {
     log(`booting: ${diskSize / 1048576} MB disk, ${chunkSize / 1024} KB chunks, ` +
         (baseIsBlank ? "blank base built locally" : `streamed from ${base}`));
     state.emulator = new V86({
-      wasm_path: `../vendor/v86/v86.wasm`,
-      memory_size: 128 * 1024 * 1024,
-      vga_memory_size: 2 * 1024 * 1024,
-      screen_container: $("screen"),
-      bios: { url: `${V86_ROOT}/bios/seabios.bin` },
-      vga_bios: { url: `${V86_ROOT}/bios/vgabios.bin` },
-      cdrom: { url: `${V86_ROOT}/images/linux4.iso` },
-      hda: diskFor(base, diskSize, baseIsBlank),
-      // The guest has no network and no package manager. This is the way bytes
-      // get in: the browser writes a file, the image mounts the share at /mnt.
-      filesystem: {},
-      // A card with nothing on the other end of it but this page, which is what
-      // lets a machine be served to another tab without anyone hosting a relay.
-      net_device: { type: "ne2k" },
-      autostart: true, disable_keyboard: true, disable_mouse: true
+      ...bootOptions({ screen: $("screen") }),
+      hda: diskFor(base, diskSize, baseIsBlank)
     });
     wireSerial();
 
@@ -783,19 +771,8 @@ $("restoreBtn").addEventListener("click", async () => {
     log(`resolved ${branch} -> ${result.commit.slice(0, 8)}, applied ${result.chunksApplied} chunks`);
 
     state.emulator = new V86({
-      wasm_path: `../vendor/v86/v86.wasm`,
-      memory_size: 128 * 1024 * 1024,
-      vga_memory_size: 2 * 1024 * 1024,
-      screen_container: $("screen"),
-      bios: { url: `${V86_ROOT}/bios/seabios.bin` },
-      vga_bios: { url: `${V86_ROOT}/bios/vgabios.bin` },
-      cdrom: { url: `${V86_ROOT}/images/linux4.iso` },
-      hda: { buffer: result.disk.buffer },
-      filesystem: {},
-      // A card with nothing on the other end of it but this page, which is what
-      // lets a machine be served to another tab without anyone hosting a relay.
-      net_device: { type: "ne2k" },
-      autostart: true, disable_keyboard: true, disable_mouse: true
+      ...bootOptions({ screen: $("screen") }),
+      hda: { buffer: result.disk.buffer }
     });
     wireSerial();
 
@@ -858,11 +835,11 @@ $("serveBtn").addEventListener("click", async () => {
     // The same site the demo serves, and only when the directory has no page of
     // its own: a machine that already holds somebody's site must not have it
     // overwritten by a demonstration of what a site is.
-    await guestRunResilient(`mkdir -p ${directory}`);
-    const present = await guestRunResilient(`test -f ${directory}/index.html; echo rc=$?`,
+    await guestRun(`mkdir -p ${directory}`);
+    const present = await guestRun(`test -f ${directory}/index.html; echo rc=$?`,
       { until: (tail) => /rc=\d/.test(tail) });
     if (!/rc=0/.test(present)) {
-      await dynamicSite.install(guestRunResilient, { directory });
+      await dynamicSite.install(guestRun, { directory });
       log(`wrote a demonstration site to ${directory}, form and all`);
     } else {
       log(`${directory} already holds an index.html; serving what is there`);
@@ -870,7 +847,7 @@ $("serveBtn").addEventListener("click", async () => {
 
     serving = await serveMachine({
       emulator: state.emulator,
-      run: guestRunResilient,
+      run: guestRun,
       device: state.device,
       engine: state.machine,
       branch: state.machine ? state.machine.branch : null,
@@ -898,8 +875,6 @@ $("unserveBtn").addEventListener("click", async () => {
   enable(["serveBtn"], true);
 });
 
-/** The app's runner, made to survive the guest's own mount retries. */
-const guestRunResilient = resilient(guestRun, { afterRecovery: restoreRuntimeState });
 
 $("reset").addEventListener("click", () => location.reload());
 

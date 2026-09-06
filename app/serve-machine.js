@@ -24,45 +24,6 @@ export const SITE = `${fs.MOUNTPOINT}/www`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /**
- * A runner that survives the guest talking over it.
- *
- * The guest retries its 9p mount on a timer for as long as it runs, and each
- * attempt prints two lines to the same console the commands go over. Landing in
- * the middle of a command being echoed, that text cuts the line in half: the
- * command never runs, no exit status is ever printed, and the shell is left
- * inside an unterminated quote with everything sent after it becoming part of
- * that unfinished line.
- *
- * Worse, that retry takes the machine's disk with it, mount point and all: a
- * command that ran fine a second ago comes back with "No such file or
- * directory" for a path that was there, because /disk is neither mounted nor a
- * directory any more -- and the guest's address and route are gone with it. The
- * guest's root is a read-only CD with everything writable in memory, so what the
- * retry disturbs is precisely everything set up since boot.
- *
- * There is no way to ask the guest not to. So: bound the wait, press Ctrl-C the
- * way a person would, put the disk back, and send the line again. The commands
- * here are all idempotent, which is what makes repeating one safe.
- */
-function resilient(run, { defaultTimeoutMs = 25000, tries = 3, afterRecovery = null } = {}) {
-  return async function (command, options = {}) {
-    const settings = typeof options === "number" ? { timeoutMs: options } : { ...options };
-    if (settings.timeoutMs === undefined) settings.timeoutMs = defaultTimeoutMs;
-
-    for (let attempt = 1; ; attempt++) {
-      try {
-        return await run(command, settings);
-      } catch (err) {
-        if (attempt >= tries) throw err;
-        // Abandon whatever half a line is sitting there, then repeat.
-        await run("\u0003", { until: () => true, timeoutMs: 1500 }).catch(() => {});
-        if (afterRecovery) await afterRecovery(run);
-      }
-    }
-  };
-}
-
-/**
  * Wait for the guest to stop printing.
  *
  * Not a fixed sleep: what is being waited for is the end of output nobody asked
@@ -164,11 +125,6 @@ export async function serveMachine({
   };
 
   async function startServing(where = directory) {
-    // Put back whatever the guest's last mount retry took: the disk the server
-    // and the site live on, and the address the tab reaches it by. Cheap, and
-    // harmless when nothing was lost, which is what makes it safe to do every
-    // time rather than only when something has already gone wrong.
-    await restoreRuntimeState(run).catch(() => {});
     await guestNet.stop(run, { name: "busybox" }).catch(() => {});
     await guestNet.serve(run, { directory: where, port: running.port, command: `${installed.path} httpd` });
     await stack.waitForPort(running.port);
@@ -344,20 +300,11 @@ export async function serveMachine({
   await fs.activateProfile(run, { profile }).catch(() => {});
   onStep(`installed ${installedControl.path}: type "rrd help" in the terminal`);
 
-  // A machine is only serving if all three of these are still true, and the
-  // guest's own mount retry can take any of them down at any moment: the disk,
-  // the network, and the server. The disk is put back by the recovery step; the
-  // other two are checked here, once everything else is in place.
+  // One check, not three. The image mounts its share once and then leaves the
+  // machine alone, so the disk, the address and the server stay where they were
+  // put -- measured over a full run: no recoveries, no resets, no restarts.
   if (!(await guestNet.reaches(run))) {
-    await guestNet.configure(run);
-    onStep(`the guest's network was reset by its own mount retry; put back: ` +
-           `${await guestNet.reaches(run) ? "reachable" : "still unreachable"}`);
-  }
-  try {
-    await stack.waitForPort(running.port, { timeoutMs: 4000 });
-  } catch {
-    await startServing(running.directory || directory);
-    onStep(`the server was taken down by the guest's mount retry; started again`);
+    onStep(`the guest cannot reach this tab, which it should be able to from boot`);
   }
 
   return {
@@ -381,20 +328,4 @@ function flatten(result) {
   return out;
 }
 
-/** A recovery step for resilient(): put back what a mount retry took away. */
-export function restoreRuntimeState(raw) {
-  return raw(
-    `mkdir -p ${fs.MOUNTPOINT}; mountpoint -q ${fs.MOUNTPOINT} || ` +
-    `mount ${fs.DEVICE} ${fs.MOUNTPOINT}; ` +
-    `ip link set lo up 2>/dev/null; ip link set ${guestNet.DEVICE} up 2>/dev/null; ` +
-    `ip addr add ${guestNet.ADDRESS}/${guestNet.PREFIX} dev ${guestNet.DEVICE} 2>/dev/null; ` +
-    `ip route add default via ${guestNet.GATEWAY} 2>/dev/null; ` +
-    // And the PATH, which the same reset takes with it. This runs in the shell
-    // the user is typing into, so putting it back here puts "rrd" back for them.
-    `case ":$PATH:" in *:${fs.MOUNTPOINT}/${fs.BIN}:*) ;; ` +
-    `*) export PATH="$PATH:${fs.MOUNTPOINT}/${fs.BIN}" ;; esac; echo rc=$?`,
-    { until: (tail) => /rc=\d/.test(tail), timeoutMs: 20000 }
-  ).catch(() => {});
-}
-
-export { resilient, settle };
+export { settle };

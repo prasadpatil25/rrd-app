@@ -30,8 +30,9 @@ import { rc, atPrompt } from "../src/guest/fs.js";
 import * as fs from "../src/guest/fs.js";
 import { V86Net } from "../src/device/net.js";
 import { MemoryHost } from "./demo-loop.js";
-import { SITE, resilient, restoreRuntimeState, serveMachine, stageFiles } from "./serve-machine.js";
+import { SITE, serveMachine, stageFiles } from "./serve-machine.js";
 import * as dynamicSite from "./dynamic-site.js";
+import { bootOptions } from "./guest-image.js";
 import { assertServing, machineOrigin } from "./net-broker.js";
 
 const V86_ROOT = "../spike-c";
@@ -63,23 +64,8 @@ export async function main({
 
   const terminal = new Terminal(document.getElementById("term"));
   const emulator = new V86({
-    wasm_path: `../vendor/v86/v86.wasm`,
-    memory_size: 128 * 1024 * 1024,
-    vga_memory_size: 2 * 1024 * 1024,
-    screen_container: document.getElementById("screen"),
-    bios: { url: `${V86_ROOT}/bios/seabios.bin` },
-    vga_bios: { url: `${V86_ROOT}/bios/vgabios.bin` },
-    cdrom: { url: `${V86_ROOT}/images/linux4.iso` },
-    // Zeros made here rather than a blank image fetched. The blank images are
-    // not in the repository -- 288 MB of nothing is not worth committing, and
-    // .gitignore says so -- which means a deployed copy of this page has no
-    // such file to fetch. The app's own boot path does the same.
-    hda: { buffer: new ArrayBuffer(DISK_SIZE) },
-    // The card, with nothing on the other end of it but this page.
-    net_device: { type: "ne2k" },
-    // And the share, which is how the server gets in.
-    filesystem: {},
-    autostart: true, disable_keyboard: true, disable_mouse: true
+    ...bootOptions({ screen: document.getElementById("screen") }),
+    hda: { buffer: new ArrayBuffer(DISK_SIZE) }
   });
   emulator.add_listener("serial0-output-byte", (b) => terminal.writeByte(b));
 
@@ -115,12 +101,11 @@ export async function main({
     if (Date.now() - t0 > 180000) throw new Error("no shell prompt in three minutes");
     await sleep(200);
   }
-  const rawRun = makeRunner({
+  const run = makeRunner({
     send: (text) => emulator.serial0_send(text),
     tail: () => terminal.tail,
     reset: () => terminal.resetTail()
   });
-  const run = resilient(rawRun, { afterRecovery: restoreRuntimeState });
   log(`shell up after ${((Date.now() - t0) / 1000).toFixed(1)}s`);
 
   // The terminal panel types into this machine now. Without it the panel shows
