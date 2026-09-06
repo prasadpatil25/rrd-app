@@ -603,6 +603,14 @@ vendor/         redistributed third-party material; see NOTICE
 ```
 
 
+## Security
+
+`SECURITY.md` records the threat model, the boundaries that were measured rather
+than assumed, and what is accepted on purpose. Three things it found were fixed
+in the writing of it: reflected cross-site scripting in the example CGI, a bridge
+that would relay a machine's responses to any embedder, and a binary the page
+fetches and a machine executes whose committed checksum nothing compared.
+
 ## Licence
 
 MIT, see `LICENSE`. Third-party material under `vendor/` keeps its own licences;

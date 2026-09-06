@@ -19,6 +19,17 @@ import { startControl } from "./control.js";
 import { assertServing, host, hostOnOrigin, machineOrigin } from "./net-broker.js";
 
 export const BUSYBOX = "../vendor/busybox/busybox-1.35.0-i686";
+
+/**
+ * What that file must hash to.
+ *
+ * It is committed beside the binary and recorded in NOTICE, and until now
+ * nothing checked it. A page fetches this over the network and hands it to a
+ * machine to execute; a copy that is not the copy this repository vouches for is
+ * the one thing here that would be worth tampering with.
+ */
+export const BUSYBOX_SHA256 =
+  "27e409705b29937b9a6105038d9c2e3eb8dc3e2c8d606d22872dbde7f47c000f";
 export const SITE = `${fs.MOUNTPOINT}/www`;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -50,8 +61,18 @@ async function settle(terminal, { quietMs = 1200, timeoutMs = 20000 } = {}) {
  * and announce the result on the console whenever it gets round to it, and one
  * interruption is easier to live with than several.
  */
-export async function stageFiles(emulator, terminal, { busybox = BUSYBOX } = {}) {
+export async function stageFiles(emulator, terminal, { busybox = BUSYBOX, expect = BUSYBOX_SHA256 } = {}) {
   const binary = new Uint8Array(await (await fetch(busybox)).arrayBuffer());
+  if (expect) {
+    const digest = [...new Uint8Array(await crypto.subtle.digest("SHA-256", binary))]
+      .map((b) => b.toString(16).padStart(2, "0")).join("");
+    if (digest !== expect) {
+      throw new Error(
+        `${busybox} is not the binary this repository vouches for: it hashes to ` +
+        `${digest.slice(0, 16)}..., not ${expect.slice(0, 16)}.... Refusing to run it in a machine.`
+      );
+    }
+  }
   await emulator.create_file("busybox", binary);
   await guestControl.stage(emulator);
   await settle(terminal);

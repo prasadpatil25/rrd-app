@@ -25,11 +25,19 @@
   var params = new URLSearchParams(location.search);
   var machine = params.get("machine") || "1";
   var parentOrigin = params.get("parent") || "";
+
+  // No parent, no bridge. Falling back to "*" would post a machine's responses
+  // to whoever embedded this page, and accepting messages from any origin would
+  // let them ask for more. Neither is a thing to do by default.
+  if (!parentOrigin) {
+    document.title = "no parent origin";
+    throw new Error("machine-origin.html needs ?parent=<origin> and will not relay without one");
+  }
   var pending = new Map();
   var nextId = 1;
 
   function toParent(message, transfer) {
-    parent.postMessage(message, parentOrigin || "*", transfer || []);
+    parent.postMessage(message, parentOrigin, transfer || []);
   }
 
   // Requests arrive from the worker, each with a port to answer on. The port
@@ -55,7 +63,7 @@
 
   // Answers come back from the tab holding the VM.
   addEventListener("message", function (event) {
-    if (parentOrigin && event.origin !== parentOrigin) return;
+    if (event.origin !== parentOrigin) return;
     var data = event.data || {};
     if (data.type !== "machine-response") return;
     var port = pending.get(data.id);

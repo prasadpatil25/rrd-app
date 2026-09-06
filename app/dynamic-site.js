@@ -93,11 +93,20 @@ export const INDEX =
  * Reversing is done with awk rather than `rev`, which this busybox does not
  * have: an applet missing from a build is not an error, it is just a column
  * that comes back empty, which is the kind of thing only a real request shows.
+ *
+ * Everything derived from the query string is encoded on the way out. Without
+ * that this is a reflected cross-site scripting hole: a page that echoes what it
+ * was sent, into HTML, on an origin that serves a machine. It would run in the
+ * guest's own origin rather than the app's, which is a smaller blast radius and
+ * not a defence -- and this file is the example somebody will copy.
  */
 export const SCRIPT = `#!/bin/sh
 BB=/disk/usr/local/bin/busybox
 field() { echo "$QUERY_STRING" | tr '&' '\\n' | grep "^$1=" | head -n 1 | cut -d= -f2-; }
 decode() { $BB httpd -d "$(printf '%s' "$1" | tr '+' ' ')"; }
+# Everything that came from the query string goes back out through this. busybox
+# encodes for HTML itself, which is one fewer sed expression to get wrong.
+esc() { $BB httpd -e "$*"; }
 
 text=$(decode "$(field text)")
 calc=$(decode "$(field calc)")
@@ -114,13 +123,13 @@ echo "</style>"
 echo "<h1>Processed inside the virtual machine</h1>"
 echo "<p class=sub>This page did not exist until you asked for it.</p>"
 echo "<table>"
-echo "<tr><td class=k>you sent</td><td>$text</td></tr>"
-echo "<tr><td class=k>upper case</td><td>$(printf '%s' "$text" | tr 'a-z' 'A-Z')</td></tr>"
-echo "<tr><td class=k>reversed</td><td>$(printf '%s' "$text" | awk '{for(i=length($0);i>0;i--)printf "%s",substr($0,i,1)}')</td></tr>"
+echo "<tr><td class=k>you sent</td><td>$(esc "$text")</td></tr>"
+echo "<tr><td class=k>upper case</td><td>$(esc "$(printf '%s' "$text" | tr 'a-z' 'A-Z')")</td></tr>"
+echo "<tr><td class=k>reversed</td><td>$(esc "$(printf '%s' "$text" | awk '{for(i=length($0);i>0;i--)printf "%s",substr($0,i,1)}')")</td></tr>"
 echo "<tr><td class=k>characters</td><td>$(printf '%s' "$text" | wc -c)</td></tr>"
 echo "<tr><td class=k>words</td><td>$(printf '%s' "$text" | wc -w)</td></tr>"
 echo "<tr><td class=k>sha256</td><td>$(printf '%s' "$text" | sha256sum | cut -c1-32)</td></tr>"
-echo "<tr><td class=k>$calc</td><td>$sum</td></tr>"
+echo "<tr><td class=k>$(esc "$calc")</td><td>$(esc "$sum")</td></tr>"
 echo "</table>"
 echo "<table>"
 echo "<tr><td class=k>ran as pid</td><td>$$ &mdash; a new one every request</td></tr>"

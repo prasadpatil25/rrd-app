@@ -1,0 +1,137 @@
+Security
+========
+
+What this is, in one line: a browser page that runs a Linux machine, holds a
+token that can write to a git repository, and serves pages the machine produced
+to other tabs. Every risk below falls out of that sentence.
+
+This is a research artifact, not a hosted service. It has no users but the person
+running it, no multi-tenancy, and no server to compromise. That narrows the
+problem considerably, and it is why several things below are accepted rather than
+fixed.
+
+
+What is worth protecting
+------------------------
+
+**The token.** It can write to a git repository. Everything else here is
+recoverable; a leaked token is not.
+
+**The repository.** Its history is the machine. An attacker who can commit can
+replace a machine with one of their choosing, and anyone who restores from that
+ref boots it.
+
+**The rest of the browser.** The token lives in a page. Whatever else that
+browser profile holds -- other origins, other sessions -- is not this project's
+to put at risk.
+
+
+Who could go after them
+-----------------------
+
+**A site running in a machine.** The strongest adversary here, because it is
+code the machine's owner did not write, executing in a browser that holds a
+token. It is the reason for the origin split.
+
+**A program inside a machine.** It can reach the control plane on the tab's
+address and ask the tab to sync or publish. Accepted; see below.
+
+**Another origin in the same browser.** Cannot read this one's storage, which is
+the browser's guarantee rather than ours, and is what the origin split leans on.
+
+**Somebody with a published URL.** Gets whatever the machine serves and nothing
+else. There is no server behind it to attack.
+
+
+Boundaries that exist, and what was measured
+--------------------------------------------
+
+**A machine's pages are served from an origin that is not the app's.** Measured:
+with a token in the app's storage, a page on the machine origin reads
+`Object.keys(localStorage)` as `[]`, reads the token as `null`, and a fetch back
+to the app's origin is blocked.
+
+**Where a second origin cannot be had, guest content is sandboxed instead.** The
+CSP `sandbox` directive puts it in an opaque origin: `localStorage` raises a
+SecurityError. It costs the page its own assets, because an opaque-origin
+document is not controlled by a service worker, so a machine there serves one
+self-contained document. The worker chooses, says which it chose, and the
+fallback is not silent.
+
+**The token is never written to disk.** Only the repository name and the host
+kind are remembered between visits. The token lives in memory for as long as the
+tab does.
+
+**The control plane is reachable only from the guest.** It listens on the tab's
+address on an emulated link with two hosts on it. Nothing outside the browser can
+route to it.
+
+**One writer at a time.** A lease on `<branch>-lease`, arbitrated by
+fast-forward-only reference updates where the host has them. Advisory where it
+does not, and it says which.
+
+
+Found in this pass, and fixed
+-----------------------------
+
+**Reflected cross-site scripting in the example CGI.** `dynamic-site.js` echoed
+the query string into HTML unescaped. It ran on the machine's own origin rather
+than the app's, which is a smaller blast radius and not a defence -- and that
+file is the one somebody copies when they write their own. Everything derived
+from a request is now encoded on the way out, by busybox rather than by a hand
+-written sed. Verified: `<script>alert(1)</script>` comes back as
+`&#60;script&#62;alert&#40;1&#41;&#60;&#47;script&#62;`.
+
+**The bridge would relay to anyone.** `machine-origin.html` fell back to
+`postMessage(..., "*")` when given no parent origin, and accepted messages from
+any origin in that case. An embedder could have received a machine's responses.
+It now refuses to relay at all without an explicit parent origin.
+
+**The binary a machine executes was never checked.** The page fetches a busybox
+over the network and hands it to a machine to run. Its checksum was committed and
+recorded in NOTICE, and nothing compared them. It is verified before the transfer
+now, and a mismatch refuses rather than warns.
+
+
+Accepted, deliberately
+----------------------
+
+**Any process in the guest can sync and publish.** The control plane has no
+notion of which program is asking, and giving it one would mean inventing an
+authentication scheme between a shell and the page hosting it. On a single-user
+machine that is the right trade: a program that can run in your VM can already
+write to your disk, and the disk is what gets committed. What limits the damage
+is the token, which is why the site lane can take a repository -- and should take
+a token -- of its own.
+
+**The token is typed into a page that may be served publicly.** Deployed on a
+static host, the page holding the token came from the internet. That is the same
+trust anyone places in a web application, and the mitigations are the ordinary
+ones: a fine-grained token, one repository, the shortest expiry the workflow
+tolerates. Rotation is the only revocation this design offers, which the README
+has always said.
+
+**Machines in one browser profile are not isolated from each other.** They share
+an origin per host arrangement, and a service worker that will serve whichever
+machine a tab is hosting. Two machines belonging to the same person is the
+assumed case.
+
+**The guest executes third-party binaries.** A kernel and a busybox, both
+recorded in NOTICE with their licences and their provenance. They are not
+audited; they are pinned and checksummed.
+
+
+Out of scope
+------------
+
+Denial of service against a machine by the person running it. Side channels
+between the guest and the host page. The security of the git host itself.
+Anything about `serve.py`, which binds to the loopback address and exists to
+serve files on one developer's machine.
+
+
+Reporting
+---------
+
+This is a research artifact with one user. If that changes, this section needs a
+real address in it.
