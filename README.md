@@ -391,14 +391,22 @@ Then tell the app where machines live, in `app/index.html`:
 <meta name="machine-origin" content="https://machines.example.com">
 ```
 
+Measured in the shape a project site has -- one origin, served under a subpath:
+
+    worker scope     http://localhost:8002/rrd-app/
+    worker script    http://localhost:8002/rrd-app/net-sw.js
+    machine URL      http://localhost:8002/rrd-app/m/1/    sandboxed
+    second tab       Machine 1 / "Served from inside the VM"
+
 **One origin, not one per machine.** Which machine a worker serves travels in its
 registration -- it is registered as `net-sw.js?machine=<name>` -- so a name per
 machine would buy nothing and cost a DNS record and a Pages site each. A hosting
 tab holds one machine, and that is what its origin serves.
 
 Without a domain -- with the meta tag left empty and nothing at
-`machines.<this host>` -- the app falls back to serving machines under
-`/m/<name>/` on its own origin behind a CSP `sandbox` directive, which protects the token and costs
+`machines.<this host>` -- the app **falls back on its own**, saying so as it does
+it, and serves machines under `<scope>m/<name>/` on its own origin behind a CSP
+`sandbox` directive, which protects the token and costs
 the guest its assets: one self-contained document, no stylesheet, no script. The
 worker chooses between the two on its own; nothing needs configuring for the
 fallback.

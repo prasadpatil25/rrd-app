@@ -16,7 +16,7 @@ import { V86Net } from "../src/device/net.js";
 import { publish, missingIndex } from "../src/core/publish.js";
 import { rc } from "../src/guest/fs.js";
 import { startControl } from "./control.js";
-import { assertServing, hostOnOrigin, machineOrigin } from "./net-broker.js";
+import { assertServing, host, hostOnOrigin, machineOrigin } from "./net-broker.js";
 
 export const BUSYBOX = "../vendor/busybox/busybox-1.35.0-i686";
 export const SITE = `${fs.MOUNTPOINT}/www`;
@@ -116,7 +116,6 @@ export async function serveMachine({
   net = null, onStep = () => {}
 } = {}) {
   const onPort = machinePort || (location.port ? Number(location.port) + 1 : null);
-  await assertServing(machineOrigin(machine, { machinePort: onPort }));
 
   const stack = net || new V86Net({ emulator });
   if (!stack.attached) stack.attach();
@@ -174,14 +173,7 @@ export async function serveMachine({
     await guestNet.serve(run, { directory: where, port: running.port, command: `${installed.path} httpd` });
     await stack.waitForPort(running.port);
     running.directory = where;
-    if (!running.served) {
-      running.served = await hostOnOrigin({
-        net: healing, machine, machinePort: onPort,
-        onEvent: (e) => onStep(e.type === "served"
-          ? `worker served ${e.path} -> ${e.status}, ${e.bytes} bytes`
-          : `worker ${e.type} ${e.url || e.path || ""}`)
-      });
-    }
+    if (!running.served) running.served = await attachHost();
     return { url: running.served.url, directory: where };
   }
 
@@ -190,6 +182,39 @@ export async function serveMachine({
 
   /** The list a machine leaves for the tab to read, so no shell is needed. */
   const MANIFEST = ".rrd-manifest";
+
+  // A declaration, not a const: startServing is called before this point in the
+  // file is reached, and a const would still be in its dead zone when it ran.
+  function forward(e) {
+    onStep(e.type === "served"
+      ? `worker served ${e.path} -> ${e.status}, ${e.bytes} bytes`
+      : `worker ${e.type} ${e.url || e.path || ""}`);
+  }
+
+  /**
+   * Put the machine somewhere a browser can reach it.
+   *
+   * An origin of its own if there is one, because that is the only arrangement
+   * in which a whole site works. If there is not -- nothing deployed at the
+   * machine origin, or a host like *.github.io where a second origin cannot be
+   * had at all -- then the app's own origin behind a sandbox, which protects the
+   * token and costs the site its assets. Falling back is worth doing and worth
+   * saying out loud: the difference between the two is visible to anyone who
+   * opens the result, and they should hear it here rather than discover it there.
+   */
+  async function attachHost() {
+    try {
+      const origin = machineOrigin(machine, { machinePort: onPort });
+      await assertServing(origin);
+      return await hostOnOrigin({ net: healing, machine, machinePort: onPort, onEvent: forward });
+    } catch (err) {
+      onStep(`no origin of its own: ${err.message.split("\n")[0]}`);
+      onStep(`falling back to this origin, sandboxed: the machine will serve one ` +
+             `self-contained document, and its stylesheets, scripts and images will not load`);
+      const served = await host({ net: healing, machine, onEvent: forward });
+      return { ...served, sandboxed: true };
+    }
+  }
 
   /**
    * Read the site out of the machine, over the machine's own web server.
@@ -337,6 +362,7 @@ export async function serveMachine({
 
   return {
     net: stack, control, url: running.served.url, directory: running.directory,
+    sandboxed: !!running.served.sandboxed,
     async stop() {
       control.close();
       if (running.served) await running.served.stop();

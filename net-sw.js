@@ -179,6 +179,7 @@ async function findHost(machine) {
     hosts.delete(machine);
   }
   const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+
   const bridge = windows.find((client) => {
     const url = new URL(client.url);
     return url.pathname.endsWith("/" + BRIDGE_NAME) &&
@@ -188,17 +189,32 @@ async function findHost(machine) {
     hosts.set(machine, bridge.id);
     return bridge;
   }
+
+  // Nothing identifiable by its address, which is the ordinary case when a
+  // machine shares the app's origin: the host is a tab like any other. So ask.
+  // A worker is stopped whenever it goes idle and started again for the next
+  // request, so an announcement made minutes ago is not something to rely on --
+  // and asking costs one round trip to tabs that are already there.
+  for (const client of windows) {
+    try {
+      const answer = await ask(client, { type: "who-hosts", machine }, [], 800);
+      if (answer && answer.hosting) {
+        hosts.set(machine, client.id);
+        return client;
+      }
+    } catch { /* not this one, or not listening */ }
+  }
   return null;
 }
 
 /** Post to a client and wait for the reply on a private port. */
-function ask(client, message, transfer = []) {
+function ask(client, message, transfer = [], timeout = REQUEST_TIMEOUT) {
   return new Promise((resolve, reject) => {
     const channel = new MessageChannel();
     const timer = setTimeout(() => {
       channel.port1.close();
-      reject(new Error(`the tab hosting this machine did not answer within ${REQUEST_TIMEOUT}ms`));
-    }, REQUEST_TIMEOUT);
+      reject(new Error(`the tab hosting this machine did not answer within ${timeout}ms`));
+    }, timeout);
 
     channel.port1.onmessage = (event) => {
       clearTimeout(timer);

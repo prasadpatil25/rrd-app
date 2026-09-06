@@ -905,6 +905,9 @@ async function autoServe() {
     say("Starting a machine. This takes about a minute...", "idle");
     const module = await import("./demo-serve.js");
     const session = await module.main({ onStep: (message) => log(message) });
+    // Before the checking starts, not after: the console is the first place
+    // anyone reaches for when something looks wrong, and the check takes a while.
+    window.machine = session;
     serving = { url: session.url, stop: () => session.stop() };
     enable(["unserveBtn"], true);
 
@@ -942,7 +945,6 @@ async function autoServe() {
     panel.append(note);
     if (failed.length) panel.className = "status bad";
 
-    window.machine = session;   // so the console can still reach it
     log("the machine is in window.machine; try: await window.machine.run('ls /disk/www')");
   } catch (err) {
     say(err.message, "bad");

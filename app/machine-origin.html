@@ -36,8 +36,14 @@
   // stays here; only an id crosses to the parent.
   navigator.serviceWorker.addEventListener("message", function (event) {
     var data = event.data || {};
-    if (data.type !== "request") return;
     var port = event.ports && event.ports[0];
+    // A worker that has been stopped and started again has forgotten who hosts
+    // what, and asking is how it finds out.
+    if (data.type === "who-hosts" && String(data.machine) === machine) {
+      if (port) port.postMessage({ hosting: true });
+      return;
+    }
+    if (data.type !== "request") return;
     if (!port) return;
     var id = nextId++;
     pending.set(id, port);

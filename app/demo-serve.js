@@ -67,11 +67,16 @@ export async function main({
   const gitHost = new MemoryHost();
   const onBranch = branch || `served-${Date.now().toString(36)}`;
 
-  // Before anything expensive. A machine takes a minute to boot, format and
-  // sync, and finding out afterwards that its origin was never being served
-  // throws all of that away for a reason that was knowable up front.
+  // Worth knowing up front, but not worth refusing over: a machine with no
+  // origin of its own still runs, still serves, and still publishes -- it just
+  // serves one document rather than a site. serveMachine says so when it falls
+  // back; this only saves a minute of booting before the news.
   const onPort = machinePort || (location.port ? Number(location.port) + 1 : null);
-  await assertServing(machineOrigin(machine, { machinePort: onPort }));
+  try {
+    await assertServing(machineOrigin(machine, { machinePort: onPort }));
+  } catch (err) {
+    log(`heads up: ${err.message.split("\n")[0]}`);
+  }
 
   const terminal = new Terminal(document.getElementById("term"));
   const emulator = new V86({
@@ -171,6 +176,7 @@ export async function main({
   return {
     emulator, device, net, engine, host: gitHost, branch: onBranch,
     run, steps, fetched, control: serving.control, url: serving.url,
+    sandboxed: serving.sandboxed,
     async stop() {
       detachKeyboard();
       await serving.stop();

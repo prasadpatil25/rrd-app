@@ -13,6 +13,18 @@
 const DEFAULT_MACHINE = "1";
 
 /**
+ * Where the worker is, relative to this module rather than to the page.
+ *
+ * It sits at the deployment root, not beside this file: a worker may only claim
+ * a scope at or below its own directory unless the server sends a header, and
+ * a static host will not send one. Resolving it from import.meta.url means a
+ * deployment under a subpath finds it too.
+ */
+function workerScript() {
+  return new URL("../net-sw.js", import.meta.url).href;
+}
+
+/**
  * Start serving a machine to the rest of the browser.
  *
  * @param {Object} options
@@ -24,7 +36,7 @@ const DEFAULT_MACHINE = "1";
  * @returns {Promise<{url: string, machine: string, stop: () => Promise<void>}>}
  */
 export async function host({
-  net, machine = DEFAULT_MACHINE, port = 80, scriptUrl = "./net-sw.js", onEvent = () => {}
+  net, machine = DEFAULT_MACHINE, port = 80, scriptUrl = workerScript(), onEvent = () => {}
 } = {}) {
   if (!net) throw new Error("a V86Net is required");
   if (!("serviceWorker" in navigator)) {
@@ -43,8 +55,15 @@ export async function host({
   const name = String(machine);
   const onMessage = async (event) => {
     const message = event.data || {};
-    if (message.type !== "request" || String(message.machine) !== name) return;
     const port_ = event.ports && event.ports[0];
+
+    // The worker forgets everything when it is stopped, which it is whenever it
+    // is idle. Answering this is how it finds its way back to this tab.
+    if (message.type === "who-hosts" && String(message.machine) === name) {
+      if (port_) port_.postMessage({ hosting: true });
+      return;
+    }
+    if (message.type !== "request" || String(message.machine) !== name) return;
     if (!port_) return;
 
     try {
@@ -187,17 +206,26 @@ function declaredMachineOrigin() {
  * disk and syncing it takes the better part of a minute, and discovering only
  * at the end that the origin was never there wastes all of it.
  */
-export async function assertServing(origin) {
+export async function assertServing(origin, { hostname = location.hostname } = {}) {
   try {
     await fetch(`${origin}/app/machine-origin.html`, { method: "HEAD", mode: "no-cors" });
   } catch {
-    const port = new URL(origin).port || "80";
-    throw new Error(
-      `nothing is serving ${origin}, so a machine has nowhere to be served from. ` +
-      `This page is on port ${location.port || "80"}, and a machine takes a port of ` +
-      `its own, so start a second copy of the static server there:\n\n` +
-      `    python serve.py ${port}\n\n` +
-      `Or pass machinePort to point at a port you are already serving.`
+    // The advice depends entirely on where this page is. Telling somebody whose
+    // site is on a static host to start a second copy of a Python server is
+    // advice about a machine they do not have.
+    const local = hostname === "localhost" || hostname.endsWith(".localhost") ||
+                  hostname === "127.0.0.1" || hostname === "[::1]" ||
+                  /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname);
+    throw new Error(local
+      ? `nothing is serving ${origin}, so a machine has nowhere to be served from. ` +
+        `A machine takes a port of its own, so start a second copy of the static ` +
+        `server there:\n\n    python serve.py ${new URL(origin).port || 80}\n`
+      : `nothing is serving ${origin}, so a machine has nowhere to be served from. ` +
+        `A machine needs an origin that is not this one, deployed with the same ` +
+        `files, and this page has to be told where it is:\n\n` +
+        `    <meta name="machine-origin" content="https://machines.example.com">\n\n` +
+        `On a bare *.github.io there is no such origin to be had -- every ` +
+        `repository is a path on one origin -- so that needs a domain of your own.`
     );
   }
   return origin;
@@ -301,7 +329,7 @@ export async function hostOnOrigin({
 }
 
 /** Which machines the worker currently believes are being hosted. */
-export async function hosted({ scriptUrl = "./net-sw.js" } = {}) {
+export async function hosted({ scriptUrl = workerScript() } = {}) {
   const registration = await navigator.serviceWorker.register(scriptUrl);
   await navigator.serviceWorker.ready;
   const worker = registration.active || navigator.serviceWorker.controller;
