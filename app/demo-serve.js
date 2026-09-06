@@ -31,6 +31,7 @@ import * as fs from "../src/guest/fs.js";
 import { V86Net } from "../src/device/net.js";
 import { MemoryHost } from "./demo-loop.js";
 import { SITE, resilient, restoreRuntimeState, serveMachine, stageFiles } from "./serve-machine.js";
+import * as dynamicSite from "./dynamic-site.js";
 import { assertServing, machineOrigin } from "./net-broker.js";
 
 const V86_ROOT = "../spike-c";
@@ -40,22 +41,22 @@ const CHUNK_SIZE = 256 * 1024;
 const PROMPT = /[#$%>]\s*$/;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-/** The site itself. Three files, because one file would not prove assets work. */
-const FILES = {
-  "index.html":
-    '<!doctype html><meta charset=utf-8><title>Machine 1</title>' +
-    '<link rel=stylesheet href="style.css"><h1>Served from inside the VM</h1>' +
-    '<p>This file is on the machine’s disk. A busybox httpd inside the guest read it ' +
-    'off that disk and wrote it to a TCP connection whose far end is JavaScript in another tab.' +
-    '<p id=probe>The stylesheet and the script have not loaded.' +
-    '<script src="app.js"></script>',
+/**
+ * The two assets, which exist to answer one question: did they load?
+ *
+ * The page itself comes from dynamic-site.js, and is written last so it can link
+ * these. Between them they show what each arrangement costs -- a machine on an
+ * origin of its own loads all of it; one sharing the app's origin loads the
+ * document and nothing else -- while the form on that page keeps working either
+ * way, because a form submission is a navigation.
+ */
+const ASSETS = {
   "style.css":
-    'body{font:15px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;max-width:60ch;' +
-    'margin:8vh auto;padding:0 20px;background:#EFF2F1;color:#131C1A}' +
-    'h1{font-size:20px}@media(prefers-color-scheme:dark){body{background:#0D1412;color:#E1E9E6}}',
+    "h1{color:#14685A}@media(prefers-color-scheme:dark){h1{color:#55C4A6}}",
   "app.js":
     'document.getElementById("probe").textContent = ' +
-    '"The stylesheet and the script both loaded, so this is a whole site and not one page.";'
+    '"Served by busybox httpd from the machine\u2019s disk. The stylesheet and the ' +
+    'script both loaded, so this machine has an origin of its own.";'
 };
 
 export async function main({
@@ -148,11 +149,12 @@ export async function main({
   log(`disk ${opened.formatted ? "formatted and " : ""}mounted at ${fs.MOUNTPOINT}`);
 
   await rc(run, `mkdir -p ${SITE}`);
-  for (const [name, body] of Object.entries(FILES)) {
+  for (const [name, body] of Object.entries(ASSETS)) {
     const written = await rc(run, `printf '%s' '${shellQuote(body)}' > ${SITE}/${name}`);
     if (!written.ok) throw new Error(`could not write ${name} onto the disk`);
   }
-  log(`wrote ${Object.keys(FILES).join(", ")} to ${SITE}`);
+  const site = await dynamicSite.install(run, { directory: SITE });
+  log(`wrote ${Object.keys(ASSETS).join(", ")}, index.html and ${dynamicSite.CGI} to ${SITE}`);
 
   const serving = await serveMachine({
     emulator, run, device, engine, branch: onBranch, machine,
@@ -162,10 +164,16 @@ export async function main({
   // Straight through the stack, before any service worker is involved. All
   // three files, because a site is not one document.
   const fetched = {};
-  for (const name of ["", ...Object.keys(FILES).slice(1)]) {
+  for (const name of ["", ...Object.keys(ASSETS), `${dynamicSite.CGI}?text=hello&calc=6*7`]) {
     const path = `/${name}`;
-    const response = await net.request({ port: 80, path });
-    fetched[path] = `${response.status} ${response.headers["content-type"] || "?"} ${response.body.length}b`;
+    // A probe that fails is worth reporting, not worth abandoning a working
+    // machine over: everything up to here is already running.
+    try {
+      const response = await net.request({ port: 80, path });
+      fetched[path] = `${response.status} ${response.headers["content-type"] || "?"} ${response.body.length}b`;
+    } catch (err) {
+      fetched[path] = `failed: ${err.message}`;
+    }
     log(`direct ${path} -> ${fetched[path]}`);
   }
 

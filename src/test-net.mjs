@@ -627,6 +627,36 @@ console.log("\nthe HTTP request writer");
   check("and it is theirs", custom.includes("Host: example.test"));
 }
 
+console.log("\nwhat a shell script writes");
+{
+  // What a CGI script actually writes. `echo` ends a line with one byte, so the
+  // headers a shell prints are separated by line feeds and the blank line that
+  // ends them is one byte too. Insisting on CRLF turns that into "the guest
+  // closed the connection before sending a complete response", which is a
+  // confusing way to be told a script printed a newline.
+  const parser = new ResponseParser();
+  parser.push(enc.encode("HTTP/1.1 200 OK\nContent-Type: text/html\n\n<h1>hi</h1>"));
+  parser.end();
+  eq("headers ending in bare line feeds parse", [parser.status, parser.headers["content-type"]],
+     [200, "text/html"]);
+  eq("and the body is the body", text(parser.body()), "<h1>hi</h1>");
+  check("with no error", parser.error === null);
+
+  const mixed = new ResponseParser();
+  mixed.push(enc.encode("HTTP/1.1 200 OK\r\nContent-Type: text/plain\nContent-Length: 2\r\n\r\nok"));
+  eq("so do headers that mix the two", [mixed.status, mixed.done, text(mixed.body())], [200, true, "ok"]);
+
+  const chunked = new ResponseParser();
+  chunked.push(enc.encode("HTTP/1.1 200 OK\nTransfer-Encoding: chunked\n\n5\nhello\n0\n\n"));
+  eq("and a chunked body counted out with line feeds", text(chunked.body()), "hello");
+  check("which is complete", chunked.done);
+
+  const request = new RequestParser();
+  request.push(enc.encode("GET /status HTTP/1.1\nHost: 10.0.2.2\n\n"));
+  eq("a request written the same way parses too", [request.method, request.path, request.done],
+     ["GET", "/status", true]);
+}
+
 console.log("\nthe response parser, against a real server");
 {
   // node writes the responses; we read the raw bytes off a real socket. What is

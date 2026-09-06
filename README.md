@@ -76,7 +76,7 @@ claims.
 |---|---|---|
 | Restore cost is the live set plus three requests, constant in history | `node src/analysis/restore-scaling.mjs` | no |
 | Write amplification and the chunk-size trade-off | `node src/analysis/report.mjs traces/mke2fs-256mb.json` | no |
-| Every invariant the design rests on (799 tests, 14 suites) | see below | no |
+| Every invariant the design rests on (806 tests, 14 suites) | see below | no |
 | GitHub costs 20x the requests and 13x the time of a batch-commit host | `node src/analysis/batch-commit.mjs github <owner/repo>` then `gitlab` | **yes** |
 | Whether a batch-commit host offers a compare-and-swap | `node src/analysis/cas-probe.mjs gitlab <owner/repo>` | **yes** |
 
@@ -99,7 +99,7 @@ for t in test test-engine test-device test-fs test-runner test-terminal \
 done
 ```
 
-799 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
+806 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
 the client half of the NBD protocol over a real socket, so the wire format and
 the server loop are exercised rather than mocked; the one hop that needs Linux
 is `nbd-client` binding the export to `/dev/nbd0`. `test-net.mjs` does the same
@@ -306,6 +306,33 @@ the VM is not on the machine's origin, so a hidden iframe there registers the
 worker and relays requests back by postMessage. Nothing of the app crosses that
 boundary: out goes a method, a path and headers, back comes a status, headers and
 bytes.
+
+### A site that is not a set of files
+
+The demo serves a form, and submitting it runs a program in the guest. It is CGI,
+which busybox httpd speaks and which needs nothing installed:
+
+    you sent      a dynamic machine        you sent      something else
+    upper case    A DYNAMIC MACHINE        upper case    SOMETHING ELSE
+    reversed      enihcam cimanyd a        reversed      esle gnihtemos
+    characters    17                       characters    14
+    (2+3)*7       35                       144/12        12
+    ran as pid    907                      ran as pid    963
+    guest clock   12:02:41 UTC             guest clock   12:02:46 UTC
+
+The process id is the point: a different one each time, because a program ran.
+
+The form uses GET deliberately. A submission is a top-level navigation, and a
+navigation is the one thing a service worker still controls when a machine has to
+share the app's origin behind a sandbox -- so the machine stays dynamic even in
+the arrangement where its stylesheet would not load.
+
+Two things this only found by being run. A CGI script writes its headers with
+`echo`, so they end in bare line feeds; a parser that insists on CRLF reports
+that as "the guest closed the connection before sending a complete response",
+which is a confusing way to be told a shell script printed a newline. And `rev`
+is not in this busybox, which is not an error -- just a column that came back
+empty.
 
 ## Publishing a site to a static host
 

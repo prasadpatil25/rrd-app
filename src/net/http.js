@@ -109,10 +109,10 @@ export class ResponseParser {
   _run() {
     for (;;) {
       if (this._phase === "head") {
-        const end = findHeadEnd(this._buffer);
-        if (end < 0) return;
-        this._parseHead(decoder.decode(this._buffer.subarray(0, end)));
-        this._buffer = this._buffer.subarray(end + 4);
+        const head = findHead(this._buffer);
+        if (!head) return;
+        this._parseHead(decoder.decode(this._buffer.subarray(0, head.at)));
+        this._buffer = this._buffer.subarray(head.at + head.length);
         continue;
       }
 
@@ -129,13 +129,13 @@ export class ResponseParser {
       }
 
       if (this._phase === "chunk-size") {
-        const line = findLine(this._buffer);
-        if (line < 0) return;
+        const line = findLineEnd(this._buffer);
+        if (!line) return;
         // A chunk size may carry extensions after a semicolon; they are not ours.
-        const text = decoder.decode(this._buffer.subarray(0, line)).split(";")[0].trim();
+        const text = decoder.decode(this._buffer.subarray(0, line.at)).split(";")[0].trim();
         const size = parseInt(text, 16);
         if (!Number.isInteger(size) || size < 0) throw new Error(`not a chunk size: "${text}"`);
-        this._buffer = this._buffer.subarray(line + 2);
+        this._buffer = this._buffer.subarray(line.at + line.length);
         if (size === 0) { this._phase = "trailer"; continue; }
         this._remaining = size;
         this._phase = "chunk-data";
@@ -148,22 +148,31 @@ export class ResponseParser {
         // of its own because the terminator can arrive one byte at a time, and
         // waiting for it while still in chunk-size reads the final CRLF as
         // another chunk header.
-        if (startsWithCrLf(this._buffer)) {
-          this._buffer = this._buffer.subarray(2);
+        const blank = startsWithNewline(this._buffer);
+        if (blank) {
+          this._buffer = this._buffer.subarray(blank);
           this.done = true;
           return;
         }
-        const end = findHeadEnd(this._buffer);
-        if (end < 0) return;                    // trailers still arriving
-        this._buffer = this._buffer.subarray(end + 4);
+        const trailers = findHead(this._buffer);
+        if (!trailers) return;                  // trailers still arriving
+        this._buffer = this._buffer.subarray(trailers.at + trailers.length);
         this.done = true;
         return;
       }
 
       if (this._phase === "chunk-data") {
-        if (this._buffer.length < this._remaining + 2) return;   // + the CRLF that ends it
+        // The data, then the line break that closes it -- one byte or two,
+        // depending on who wrote it.
+        if (this._buffer.length < this._remaining + 1) return;
+        const after = this._buffer.subarray(this._remaining);
+        const ending = startsWithNewline(after);
+        if (!ending) {
+          if (after.length < 2) return;                 // a lone CR, still waiting on its LF
+          throw new Error("a chunk did not end with a line break");
+        }
         this._takeBody(this._buffer.subarray(0, this._remaining));
-        this._buffer = this._buffer.subarray(this._remaining + 2);
+        this._buffer = this._buffer.subarray(this._remaining + ending);
         this._remaining = 0;
         this._phase = "chunk-size";
         continue;
@@ -174,7 +183,7 @@ export class ResponseParser {
   }
 
   _parseHead(text) {
-    const [statusLine, ...headerLines] = text.split("\r\n");
+    const [statusLine, ...headerLines] = text.split(/\r?\n/);
     const match = /^HTTP\/(\d\.\d) (\d{3})(?: (.*))?$/.exec(statusLine);
     if (!match) throw new Error(`not an HTTP response: "${statusLine.slice(0, 60)}"`);
     this.status = Number(match[2]);
@@ -302,10 +311,10 @@ export class RequestParser {
     this._buffer = concat(this._buffer, bytes);
     try {
       if (this._phase === "head") {
-        const end = findHeadEnd(this._buffer);
-        if (end < 0) return;
-        this._parseHead(decoder.decode(this._buffer.subarray(0, end)));
-        this._buffer = this._buffer.subarray(end + 4);
+        const head = findHead(this._buffer);
+        if (!head) return;
+        this._parseHead(decoder.decode(this._buffer.subarray(0, head.at)));
+        this._buffer = this._buffer.subarray(head.at + head.length);
       }
       if (this._phase !== "body") return;
       const take = Math.min(this._remaining, this._buffer.length);
@@ -334,7 +343,7 @@ export class RequestParser {
   get query() { return new URLSearchParams(this.target.split("?").slice(1).join("?")); }
 
   _parseHead(text) {
-    const [requestLine, ...headerLines] = text.split("\r\n");
+    const [requestLine, ...headerLines] = text.split(/\r?\n/);
     const match = /^([A-Z]+) (\S+) HTTP\/(\d\.\d)$/.exec(requestLine);
     if (!match) throw new Error(`not an HTTP request: "${requestLine.slice(0, 60)}"`);
     this.method = match[1];
@@ -441,22 +450,39 @@ function concat(a, b) {
   return out;
 }
 
-/** The offset of the blank line that ends a header block, or -1. */
-function findHeadEnd(bytes) {
-  for (let i = 0; i + 3 < bytes.length; i++) {
-    if (bytes[i] === CR && bytes[i + 1] === LF && bytes[i + 2] === CR && bytes[i + 3] === LF) return i;
+/**
+ * Where a header block ends, and how long its terminator is.
+ *
+ * CRLF is what the specification says and what a server written to it sends. It
+ * is not what everything sends: a CGI script writes its headers with echo, and
+ * what reaches the client is separated by bare line feeds. A parser that insists
+ * on CRLF reads that as a response whose headers never ended -- which is a
+ * confusing way to be told a shell script printed a newline.
+ *
+ * @returns {{at: number, length: number}|null}
+ */
+function findHead(bytes) {
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] === CR && bytes[i + 1] === LF && bytes[i + 2] === CR && bytes[i + 3] === LF) {
+      return { at: i, length: 4 };
+    }
+    if (bytes[i] === LF && bytes[i + 1] === LF) return { at: i, length: 2 };
   }
-  return -1;
+  return null;
 }
 
-/** The offset of the CRLF that ends a line, or -1. */
-function findLine(bytes) {
-  for (let i = 0; i + 1 < bytes.length; i++) {
-    if (bytes[i] === CR && bytes[i + 1] === LF) return i;
+/** The offset of the line ending, and its length, or null. */
+function findLineEnd(bytes) {
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] === CR && bytes[i + 1] === LF) return { at: i, length: 2 };
+    if (bytes[i] === LF) return { at: i, length: 1 };
   }
-  return -1;
+  return null;
 }
 
-function startsWithCrLf(bytes) {
-  return bytes.length >= 2 && bytes[0] === CR && bytes[1] === LF;
+/** The length of a line ending at the start of these bytes, or 0. */
+function startsWithNewline(bytes) {
+  if (bytes.length >= 2 && bytes[0] === CR && bytes[1] === LF) return 2;
+  if (bytes.length >= 1 && bytes[0] === LF) return 1;
+  return 0;
 }
