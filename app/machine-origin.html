@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>machine bridge</title></head>
+<body>
+<!--
+  The bridge between a machine's own origin and the tab that holds the machine.
+
+  This page is loaded in a hidden iframe by the tab running the VM, from
+  http://machine-<name>.<host>/ rather than from the app's origin. It registers
+  the service worker there and claims the root scope, so every path on that
+  origin belongs to the guest.
+
+  It exists because of a rule with no way round it: a service worker can only be
+  registered by a page on its own origin. The tab holding the VM is on the app's
+  origin and cannot register anything here, so something on this origin has to
+  do it, and then pass requests back across the boundary by postMessage.
+
+  Nothing of the app crosses that boundary. What goes out is a method, a path
+  and headers; what comes back is a status, headers and bytes. The guest cannot
+  reach the app's storage because it is not on the app's origin any more, which
+  is the entire point of the arrangement.
+-->
+<script>
+(function () {
+  var params = new URLSearchParams(location.search);
+  var machine = params.get("machine") || "1";
+  var parentOrigin = params.get("parent") || "";
+  var pending = new Map();
+  var nextId = 1;
+
+  function toParent(message, transfer) {
+    parent.postMessage(message, parentOrigin || "*", transfer || []);
+  }
+
+  // Requests arrive from the worker, each with a port to answer on. The port
+  // stays here; only an id crosses to the parent.
+  navigator.serviceWorker.addEventListener("message", function (event) {
+    var data = event.data || {};
+    if (data.type !== "request") return;
+    var port = event.ports && event.ports[0];
+    if (!port) return;
+    var id = nextId++;
+    pending.set(id, port);
+    toParent({
+      type: "machine-request", id: id, machine: machine,
+      method: data.method, path: data.path, headers: data.headers, body: data.body
+    }, data.body ? [data.body] : []);
+  });
+
+  // Answers come back from the tab holding the VM.
+  addEventListener("message", function (event) {
+    if (parentOrigin && event.origin !== parentOrigin) return;
+    var data = event.data || {};
+    if (data.type !== "machine-response") return;
+    var port = pending.get(data.id);
+    if (!port) return;
+    pending.delete(data.id);
+    port.postMessage(data.answer, data.answer && data.answer.body ? [data.answer.body] : []);
+  });
+
+  function tell(worker, message) {
+    return new Promise(function (resolve, reject) {
+      var channel = new MessageChannel();
+      var timer = setTimeout(function () {
+        channel.port1.close();
+        reject(new Error("the worker on this origin did not answer"));
+      }, 5000);
+      channel.port1.onmessage = function (event) {
+        clearTimeout(timer); channel.port1.close(); resolve(event.data || {});
+      };
+      worker.postMessage(message, [channel.port2]);
+    });
+  }
+
+  // Relative, and with no scope of its own: the worker sits at the deployment
+  // root, so its default scope is that root. Asking for a wider scope would need
+  // a Service-Worker-Allowed header, and a static host will not send one.
+  var script = new URL("../net-sw.js?machine=" + encodeURIComponent(machine), location.href);
+  navigator.serviceWorker.register(script.href)
+    .then(function (registration) {
+      return navigator.serviceWorker.ready.then(function () { return registration; });
+    })
+    .then(function (registration) {
+      var worker = registration.active || navigator.serviceWorker.controller;
+      if (!worker) throw new Error("the worker registered but never became active");
+      return tell(worker, { type: "host", machine: machine });
+    })
+    .then(function (answer) {
+      toParent({ type: "machine-ready", machine: machine, url: answer.url || location.origin + "/" });
+    })
+    .catch(function (err) {
+      toParent({ type: "machine-failed", machine: machine, error: String(err && err.message || err) });
+    });
+})();
+</script>
+</body>
+</html>
