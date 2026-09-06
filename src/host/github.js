@@ -54,7 +54,12 @@ export class GitHubHost extends Host {
       const commit = await this.request("GET", this.base(`/git/commits/${ref.object.sha}`));
       return { commit: ref.object.sha, tree: commit.tree.sha };
     } catch (err) {
-      if (err.status === 404) return null;
+      // A branch that is not there is a 404. A repository with nothing in it at
+      // all is a 409, "Git Repository is empty" -- which is the state every
+      // repository starts in, and therefore the state the first publish to one
+      // meets. Both mean the same thing to a caller: there is no previous commit
+      // to build on.
+      if (err.status === 404 || err.status === 409) return null;
       throw err;
     }
   }
@@ -105,7 +110,46 @@ export class GitHubHost extends Host {
     });
   }
 
-  async commit({ branch, message, files, parent = null, orphan = false, branchExists }) {
+  /**
+   * Commit, seeding the repository first if it has never had one.
+   *
+   * A repository with no commits at all refuses every write to the git data
+   * API -- blobs included -- with 409 "Git Repository is empty". That is the
+   * state every new repository starts in, so it is the state the first publish
+   * to one meets, and telling somebody to go and add a README by hand is a poor
+   * answer. The contents API does work on an empty repository, so one file goes
+   * in that way and the ordinary path takes it from there.
+   */
+  async commit(options) {
+    try {
+      return await this._commit(options);
+    } catch (err) {
+      if (err.status !== 409 || !/empty/i.test(err.message)) throw err;
+      if (!options.files || !options.files.length) throw err;
+      await this._seed(options.branch, options.files[0], options.message);
+      const head = await this.resolveRef(options.branch);
+      const result = await this._commit({
+        ...options, parent: head ? head.commit : null, branchExists: !!head
+      });
+      // The seed is a commit too, and a caller counting requests should see it.
+      return { ...result, requests: result.requests + 1, seeded: true };
+    }
+  }
+
+  /** One file, through the API that works on a repository with no commits. */
+  async _seed(branch, file, message) {
+    await this.governed(() =>
+      this.request("PUT", this.base(`/contents/${encodeURI(file.path)}`), {
+        body: {
+          message: `${message || "publish"} (first commit)`,
+          content: toBase64(file.bytes),
+          branch
+        }
+      })
+    );
+  }
+
+  async _commit({ branch, message, files, parent = null, orphan = false, branchExists }) {
     const before = this.requestCount;
     const toUpload = files.filter((f) => !f.skipUpload);
 

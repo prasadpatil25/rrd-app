@@ -76,7 +76,7 @@ claims.
 |---|---|---|
 | Restore cost is the live set plus three requests, constant in history | `node src/analysis/restore-scaling.mjs` | no |
 | Write amplification and the chunk-size trade-off | `node src/analysis/report.mjs traces/mke2fs-256mb.json` | no |
-| Every invariant the design rests on (806 tests, 14 suites) | see below | no |
+| Every invariant the design rests on (809 tests, 14 suites) | see below | no |
 | GitHub costs 20x the requests and 13x the time of a batch-commit host | `node src/analysis/batch-commit.mjs github <owner/repo>` then `gitlab` | **yes** |
 | Whether a batch-commit host offers a compare-and-swap | `node src/analysis/cas-probe.mjs gitlab <owner/repo>` | **yes** |
 
@@ -99,7 +99,7 @@ for t in test test-engine test-device test-fs test-runner test-terminal \
 done
 ```
 
-806 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
+809 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
 the client half of the NBD protocol over a real socket, so the wire format and
 the server loop are exercised rather than mocked; the one hop that needs Linux
 is `nbd-client` binding the export to `/dev/nbd0`. `test-net.mjs` does the same
@@ -382,6 +382,29 @@ published 4 files (770 bytes) ... as c6      one parent: the history is a chain
 
 Point a static host at that ref and the site is live with nothing running: the
 tab can close, the machine can be thrown away, and the page stays up.
+
+**Done against a real repository**, not only against a Map:
+
+    validated as prasadpatil25, public, canWrite=true
+    published 3 files, 1439 bytes, 7 requests, 4.2s   163ee524
+    published 4 files, 1739 bytes, 7 requests, 2.6s   f5f5511a   parent: 163ee524
+
+    $ gh api repos/prasadpatil25/rrd-site/git/trees/site
+    about.html   568b  d96bb088
+    index.html   509b  61a2e773
+    second.html  300b  6c10e734
+    style.css    362b  07f00eb4
+
+Pages pointed at that ref built in about forty seconds, and the second publish
+was live thirty seconds after it: <https://prasadpatil25.github.io/rrd-site/>.
+
+Two things only a real host could say. A repository that has never had a commit
+answers `409 Git Repository is empty` where a missing branch answers 404 -- and
+it is the state every new repository starts in, so it is the state the first
+publish to one meets. Worse, it refuses every write to the git data API,
+blobs included, until it has a commit. The contents API does work there, so the
+adapter puts one file in that way and lets the ordinary path take over; the first
+publish to a fresh repository is therefore two commits, and says so.
 
 **How the site is read out.** Over the machine's own web server, not over the 9p
 share and not by asking its shell. The share knocks the guest's state over; and

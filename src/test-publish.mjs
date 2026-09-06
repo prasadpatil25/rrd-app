@@ -214,6 +214,36 @@ console.log("\npublishing");
   eq("it says what it is doing", events, ["publishing", "published"]);
 }
 
+{
+  // Two things a real host taught this lane, both of which an in-memory double
+  // is constitutionally unable to teach: a repository that has never had a
+  // commit is not a repository with a missing branch, and it refuses every write
+  // to the git data API until it has one.
+  const empty = new Host();
+  empty.emptyUntilSeeded = true;
+  const original = empty.commit.bind(empty);
+  let refusals = 0;
+  empty.commit = async (options) => {
+    if (empty.emptyUntilSeeded) {
+      refusals++;
+      empty.emptyUntilSeeded = false;
+      const err = new Error("POST /git/blobs -> 409 Git Repository is empty.");
+      err.status = 409;
+      throw err;
+    }
+    return original(options);
+  };
+
+  let failed = null;
+  try {
+    await publish({ host: empty, branch: "site", files: [file("index.html", "x")] });
+  } catch (err) { failed = err.message; }
+  eq("a host that refuses an empty repository is met once", refusals, 1);
+  check("and the refusal reaches the caller rather than being swallowed",
+        /empty/i.test(failed || ""), failed);
+  check("with the status it came with", /409/.test(failed || ""), failed);
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed) { console.log("failures: " + failures.join("; ")); process.exit(1); }
 process.exit(0);
