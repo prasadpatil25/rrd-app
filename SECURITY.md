@@ -66,6 +66,11 @@ tab does.
 address on an emulated link with two hosts on it. Nothing outside the browser can
 route to it.
 
+**A machine has no way out unless one is opened.** The guest's only route is to
+the tab. It cannot resolve a name, reach a mirror, or call an API, which means
+nothing running in a machine can send anything anywhere. That is a property of
+the design rather than a policy, and it holds until somebody starts a gateway.
+
 **One writer at a time.** A lease on `<branch>-lease`, arbitrated by
 fast-forward-only reference updates where the host has them. Advisory where it
 does not, and it says which.
@@ -92,6 +97,33 @@ over the network and hands it to a machine to run. Its checksum was committed an
 recorded in NOTICE, and nothing compared them. It is verified before the transfer
 now, and a mismatch refuses rather than warns.
 
+
+The gateway, which trades that away on purpose
+----------------------------------------------
+
+`src/net/gateway.js` is a door in the wall above: the guest speaks plain HTTP to
+a proxy on the tab's address, and the tab satisfies each request with `fetch()`.
+It exists because a machine with no way out cannot install anything, call
+anything, or fetch its own source.
+
+**It is off unless asked for, and it refuses to start with an empty allowlist**
+-- a gateway that admits nothing is what not starting one already does, so an
+empty list is a mistake rather than a configuration. `serveMachine` takes
+`allowOutbound: ["api.github.com"]` and nothing else opens it.
+
+What it deliberately cannot do. It will not answer `CONNECT`: tunnelling TLS
+would mean terminating the guest's TLS in the tab and reading everything inside,
+which is a man in the middle however well meant. And it can only reach hosts that
+permit cross-origin reads, because the tab's `fetch` obeys the browser. Measured
+from a page on localhost: `api.github.com`, `raw.githubusercontent.com`,
+`registry.npmjs.org` and `httpbin.org` answer; `dl-cdn.alpinelinux.org` and
+`example.com` do not. A package mirror is out of reach either way, which is why
+this project vendors what a guest needs.
+
+Every request through it is announced to the page that opened it, with the host,
+the path, the status and the byte count. **Turning it on means a machine can
+exfiltrate to the hosts you named.** That is the trade, stated rather than
+buried: a machine that can fetch is a machine that can send.
 
 Accepted, deliberately
 ----------------------

@@ -77,7 +77,7 @@ claims.
 | Restore cost is the live set plus three requests, constant in history | `node src/analysis/restore-scaling.mjs` | no |
 | Write amplification and the chunk-size trade-off | `node src/analysis/report.mjs traces/mke2fs-256mb.json` | no |
 | What a publish costs, and how it scales | `node src/analysis/publish-cost.mjs` | no |
-| Every invariant the design rests on (858 tests, 15 suites) | see below | no |
+| Every invariant the design rests on (881 tests, 16 suites) | see below | no |
 | GitHub costs 20x the requests and 13x the time of a batch-commit host | `node src/analysis/batch-commit.mjs github <owner/repo>` then `gitlab` | **yes** |
 | Whether a batch-commit host offers a compare-and-swap | `node src/analysis/cas-probe.mjs gitlab <owner/repo>` | **yes** |
 
@@ -95,12 +95,12 @@ disk, not a synthetic workload.
 ```
 for t in test test-engine test-device test-fs test-runner test-terminal \
          test-keyboard test-alpine test-sweep test-bisect test-nbd test-batch \
-         test-net test-publish test-lease; do
+         test-net test-publish test-lease test-gateway; do
   node src/$t.mjs
 done
 ```
 
-858 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
+881 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
 the client half of the NBD protocol over a real socket, so the wire format and
 the server loop are exercised rather than mocked; the one hop that needs Linux
 is `nbd-client` binding the export to `/dev/nbd0`. `test-net.mjs` does the same
@@ -434,6 +434,41 @@ machine cannot both win.
 From inside the machine, `rrd status` shows who has it. The engine behaves
 exactly as it always did when no lease is passed.
 
+## A way out, for a guest that has none
+
+A machine's only route is to the tab, which is why nothing in one can phone home.
+It is also a wall: no mirror, no API, no git over HTTPS. `src/net/gateway.js` is a
+narrow door in it. The guest speaks plain HTTP to a proxy on the tab's address and
+the tab answers with `fetch()`:
+
+```js
+const session = await main({ allowOutbound: ["api.github.com"] });
+```
+
+From inside the machine, with nothing else changed:
+
+    ~% echo $http_proxy
+    http://10.0.2.2:8080
+
+    ~% wget -qO- http://api.github.com/repos/prasadpatil25/rrd-site
+    { "id": 1359226983, "name": "rrd-site", "full_name": "prasadpatil25/rrd-site", ...
+
+    ~% wget -qO- http://example.com/
+    wget: server returned error: HTTP/1.1 403
+
+Three things it will not do, and each is a decision rather than a gap. It refuses
+to start with an empty allowlist, because a gateway that admits nothing is what
+not starting one already does. It refuses `CONNECT`, because tunnelling TLS means
+terminating it in the tab and reading everything inside. And it can only reach
+hosts that permit cross-origin reads, because the tab's `fetch` obeys the
+browser -- measured: `api.github.com`, `raw.githubusercontent.com`,
+`registry.npmjs.org` and `httpbin.org` answer; `dl-cdn.alpinelinux.org` and
+`example.com` do not.
+
+Every request through it is announced with its host, path, status and size.
+`SECURITY.md` says what turning it on costs: a machine that can fetch is a
+machine that can send.
+
 ## Publishing a site to a static host
 
 Serving a machine reaches other tabs in one browser. Publishing reaches everyone,
@@ -594,6 +629,7 @@ guest/          the machine's kernel and initramfs, and the script that builds i
 src/net/        the tab's TCP/IP stack: wire format, connections, HTTP
 src/core/publish.js  the publish lane: a site as a tree, on a ref of its own
 src/core/lease.js    one writer at a time, on a ref of its own
+src/net/gateway.js   a way out, off by default and allowlisted when on
 net-sw.js       the worker that serves a machine, at the root so it can claim it
 app/control.js  the control plane the guest talks to; src/guest/control.js is its client
 src/ui/         terminal renderer and keyboard mapping

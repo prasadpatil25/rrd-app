@@ -44,7 +44,8 @@ const PROMPT = /[#$%>]\s*$/;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export async function main({
-  machine = "1", branch = null, machinePort = null, onStep = console.log
+  machine = "1", branch = null, machinePort = null, allowOutbound = null,
+  onStep = console.log
 } = {}) {
   const steps = [];
   const log = (message) => { steps.push(message); onStep(message); };
@@ -135,7 +136,7 @@ export async function main({
   log(`wrote the site to ${SITE}: index.html, ${dynamicSite.CGI} and its assets`);
 
   const serving = await serveMachine({
-    emulator, run, device, engine, branch: onBranch, machine, lease,
+    emulator, run, device, engine, branch: onBranch, machine, lease, allowOutbound,
     machinePort: onPort, net, directory: SITE, onStep: log
   });
 

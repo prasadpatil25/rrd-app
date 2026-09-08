@@ -16,6 +16,7 @@ import { V86Net } from "../src/device/net.js";
 import { publish, missingIndex } from "../src/core/publish.js";
 import { rc } from "../src/guest/fs.js";
 import { startControl } from "./control.js";
+import { startGateway, PROXY_URL } from "../src/net/gateway.js";
 import { assertServing, host, hostOnOrigin, machineOrigin } from "./net-broker.js";
 
 export const BUSYBOX = "../vendor/busybox/busybox-1.35.0-i686";
@@ -92,7 +93,7 @@ export async function stageFiles(emulator, terminal, { busybox = BUSYBOX, expect
  * @param {(message: string) => void} [options.onStep]
  */
 export async function serveMachine({
-  emulator, run, device, engine, branch, lease = null,
+  emulator, run, device, engine, branch, lease = null, allowOutbound = null,
   machine = "1", directory = SITE, machinePort = null,
   publishHost = null, publishBranch = null,
   net = null, onStep = () => {}
@@ -318,6 +319,20 @@ export async function serveMachine({
   });
 
   const profile = `${fs.MOUNTPOINT}/.profile`;
+  // A way out, only if one was asked for by name. Until a gateway is running a
+  // machine cannot send anything anywhere, and that is worth keeping by default.
+  let gateway = null;
+  if (allowOutbound && allowOutbound.length) {
+    gateway = startGateway({
+      net: stack, allow: allowOutbound,
+      onEvent: (e) => onStep(e.type === "fetched"
+        ? `out: ${e.host}${e.path} -> ${e.status}, ${e.bytes} bytes in ${e.ms}ms`
+        : `gateway ${e.type}${e.host ? " " + e.host : ""}`)
+    });
+    await rc(run, `printf '%s\\n' 'export http_proxy=${PROXY_URL}' 'export https_proxy=${PROXY_URL}' >> ${profile}`);
+    onStep(`the machine may now reach ${allowOutbound.join(", ")} and nothing else`);
+  }
+
   const installedControl = await guestControl.install({ run, fs, profile });
   await fs.activateProfile(run, { profile }).catch(() => {});
   onStep(`installed ${installedControl.path}: type "rrd help" in the terminal`);
@@ -330,9 +345,10 @@ export async function serveMachine({
   }
 
   return {
-    net: stack, control, url: running.served.url, directory: running.directory,
+    net: stack, control, gateway, url: running.served.url, directory: running.directory,
     sandboxed: !!running.served.sandboxed,
     async stop() {
+      if (gateway) gateway.close();
       control.close();
       if (running.served) await running.served.stop();
       await guestNet.stop(run, { name: "busybox" }).catch(() => {});

@@ -410,6 +410,10 @@ export function serve(stack, { port = 80, handler, maxBody } = {}) {
       try {
         const result = await handler({
           method: parser.method, path: parser.path, query: parser.query,
+          // The whole request target as well as its path. A proxy is given an
+          // absolute URL where a server is given a path, and the difference is
+          // the only thing that tells one from the other.
+          target: parser.target,
           headers: parser.headers, body: parser.body()
         });
         response = typeof result === "string" || result instanceof Uint8Array
