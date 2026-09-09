@@ -14,6 +14,31 @@ is five operations wide, and there are three implementations of it: in memory
 for the tests, over v86's buffer for the browser, and over NBD for a real Linux
 kernel.
 
+## What this can and cannot run
+
+Before the quick start, because it is easier to read here than to discover.
+
+The guest is a 32-bit x86 machine emulated in JavaScript, on one core, with no
+JIT for the code it runs. Measured on this project's own demo:
+
+    a static file, through the stack        9.4 ms median
+    a CGI script                          195.8 ms median
+    4 MB off the machine's disk           3.12 MB/s
+    boot to a shell                          4-6 s
+
+So: a static site, a small dynamic site, a shell, a build that takes seconds, a
+tool that transforms a file. Comfortably.
+
+Not: anything anyone would call a workload. No database under load, no
+concurrent users, no compilation of a large program, nothing latency-sensitive.
+The gap between 9 ms and 196 ms above is a process being forked, and that is the
+cost of doing anything at all per request.
+
+The machine is the interesting part, not the machine's speed. What this project
+is for is that a machine has a version history and can be rebuilt anywhere from a
+reference; if you need throughput, a virtual machine in a browser tab is the
+wrong place to look for it.
+
 ## Quick start
 
 Running a machine, and reaching the site it serves from another tab.
@@ -126,6 +151,27 @@ GITLAB_TOKEN=... node src/analysis/batch-commit.mjs gitlab owner/repo
 
 Use a fine-grained token scoped to the one repository, with the shortest expiry
 your workflow tolerates. Rotation is the only revocation this design offers.
+
+## Whose repository, for real use
+
+A repository as a block store is fine for one researcher and dicey for anything
+with users. Every sync writes real git objects and spends a real write budget;
+GitHub warns past a gigabyte and is unhappy past five; and the publish lane adds
+history every time somebody rebuilds a site. None of that is hypothetical, and
+none of it is the host's fault -- it is what asking a code-hosting service to be
+a block device looks like at scale.
+
+**The supported answer for real use is to host it yourself.** `src/host/forgejo.js`
+already exists and speaks to Forgejo and Gitea, which are a container and a
+volume. Self-hosted, the limits become yours to set: your disk, your rate limit,
+your retention, and no terms of service to read twice. `compareHosts()` reports
+what changes with the host -- a batch-commit host puts a whole commit in one
+request and meets a body limit instead of a request limit.
+
+Use a hosted forge for what this repository does: a throwaway repository, a
+fine-grained token scoped to it alone, and the shortest expiry the work tolerates.
+Rotation is the only revocation this design offers, which is a reason to keep the
+blast radius small rather than a reason to avoid the design.
 
 ## The browser machine
 
@@ -468,6 +514,112 @@ browser -- measured: `api.github.com`, `raw.githubusercontent.com`,
 Every request through it is announced with its host, path, status and size.
 `SECURITY.md` says what turning it on costs: a machine that can fetch is a
 machine that can send.
+
+## Calling a machine from outside the browser
+
+Other tabs reach a machine through the service worker. Nothing else can: a tab
+cannot listen on a port, so curl has nothing to connect to. `tools/bridge.mjs` is
+the smallest thing that fixes that for development. It listens on loopback, the
+tab connects *out* to it and asks whether anything has arrived, and a request is
+carried into the machine and answered the same way.
+
+```
+node tools/bridge.mjs
+```
+
+then, in the app's console, with a machine running:
+
+```js
+const b = await import("./bridge-client.js");
+await b.connect({ net: window.machine.net });
+```
+
+and from anywhere on that computer:
+
+```
+$ curl localhost:9000/cgi-bin/process.cgi?text=called+by+curl
+you sent      called by curl
+upper case    CALLED BY CURL
+reversed      lruc yb dellac
+(6*7)         42
+ran as pid    1012 - a new one every request
+```
+
+It is a server, which the rest of this project is at pains not to be. It is on
+your own machine, in a `tools/` directory, and it is for testing: curl, Postman,
+a test suite, anything that is not a browser tab. `SECURITY.md` notes what it
+opens.
+
+### From another computer, and from the internet
+
+Loopback is the default because it is the safe one. Two flags widen it, and the
+second one is not optional:
+
+```
+node tools/bridge.mjs 9000 --host 0.0.0.0 --token <secret>
+```
+
+`--host` binds beyond loopback so a phone or a laptop on the same network can
+reach the machine. Off loopback the bridge **refuses to start without a token**;
+omit `--token` and it generates one and prints it rather than coming up open.
+Every request carries it -- `?token=...` or `Authorization: Bearer ...` -- and so
+do the `/_bridge/*` endpoints, or a stranger could poll for pending requests and
+answer them before your tab did. The tab passes it too:
+
+```js
+await b.connect({ net: window.machine.net, token: "<secret>" });
+```
+
+For a public URL, put a tunnel in front of loopback rather than opening a port on
+the router. Any tunnel works; cloudflared needs no account for a quick one:
+
+```
+cloudflared tunnel --url http://localhost:9000
+```
+
+It prints an `https://<name>.trycloudflare.com` address, and that address reaches
+a CGI script running inside a VM in a browser tab:
+
+```
+$ curl "https://casey-klein-referenced-dryer.trycloudflare.com/cgi-bin/process.cgi?text=hello+from+the+internet&token=..."
+you sent      hello from the internet
+upper case    HELLO FROM THE INTERNET
+ran as pid    1577 - a new one every request
+guest clock   Wed Sep  9 00:21:19 UTC 2026
+kernel        Linux 4.16.13 i686
+```
+
+Without the token the same URL is a 401. The path is now: Cloudflare's edge, the
+tunnel, the bridge, a long-poll to the tab, a TCP stack written in JavaScript, an
+emulated NIC, busybox httpd, `fork`. Measured from a second host:
+
+    static page, over the tunnel     440 ms
+    the CGI, straight at the bridge  1.13 s
+    the CGI, over the tunnel         1.35-1.75 s
+
+so the tunnel costs about 350 ms and the rest is the guest forking a shell script
+under emulation. That is a demonstration, not a service. The tunnel operator sees
+every request in clear, the URL dies with the process, and the whole thing stops
+when you close the tab -- which is the honest shape of a personal cloud whose
+compute is a browser you happen to have open.
+
+**About the 200 milliseconds that were not there.** Measured end to end it looked
+slow: 220 ms a request, against 9.4 ms straight through the stack. Three
+plausible explanations were wrong -- connection starvation from parked polls, a
+CORS preflight on every answer, Nagle against delayed acknowledgement -- and each
+produced a change that is still in the code because each is an improvement on its
+own terms. The cause was none of them. Timing the stages showed the bridge
+collecting a request in 0 ms and answering in 10-15 ms, so the time was outside
+it entirely:
+
+    connect to localhost:9000    210 ms
+    connect to 127.0.0.1:9000    0.8 ms
+
+`localhost` resolves to `::1` first on a Windows client, the server was bound
+only to IPv4, and the client waited out the failed attempt before trying the
+other address. The bridge listens on both loopback addresses now, and the same
+request takes **15 ms**. The lesson is the ordinary one: measure the stages
+before believing any story about which one is slow.
 
 ## Publishing a site to a static host
 

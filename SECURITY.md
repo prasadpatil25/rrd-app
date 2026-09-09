@@ -125,6 +125,43 @@ the path, the status and the byte count. **Turning it on means a machine can
 exfiltrate to the hosts you named.** That is the trade, stated rather than
 buried: a machine that can fetch is a machine that can send.
 
+The bridge, which is a development tool
+---------------------------------------
+
+`tools/bridge.mjs` lets curl and anything else outside the browser call a
+machine, by listening on a port while the tab connects out to it. By default it
+binds `127.0.0.1` and `::1` and nothing else, so it is reachable from that
+computer and not from a network.
+
+While it runs, **anything that can reach it can reach whatever the guest is
+serving** -- on loopback that means another user account, another program, a
+browser extension with local access. That is the same trust anyone extends to a
+development server, and it is why this lives in `tools/` rather than in `app/`,
+is started by hand, and stops when you stop it.
+
+`--host 0.0.0.0` moves that boundary, so the boundary is replaced rather than
+removed: **off loopback the bridge will not start without a token**, and given
+none it generates one and prints it rather than coming up open. Every request
+carries it, as `Authorization: Bearer` or `?token=`; the `/_bridge/*` endpoints
+need it too, or a stranger could poll for pending requests and answer them
+before the tab did. It is compared with `timingSafeEqual`, since `===` on a
+secret leaks its prefix to anyone patient enough to measure.
+
+What the token is not is a permission system. It is one secret for the whole
+machine: whoever holds it can request anything the guest serves and run any CGI
+in it, and it travels in the URL when it is on the query string, so it lands in
+proxy logs and browser history. It is the difference between exposed and
+exposed-to-anyone, not between exposed and safe.
+
+The public case adds a third party. A tunnel (`cloudflared tunnel --url
+http://localhost:9000`) gives a public HTTPS URL without opening a port on the
+router, and in exchange **the tunnel operator terminates the TLS and sees every
+request and response in clear**. The address is unauthenticated and guessable in
+the sense that anything that learns it -- a referrer header, a paste, a crawler
+following a link -- can reach the bridge, which is the whole reason the token is
+mandatory there. A quick tunnel's URL is new each time it starts and dies with
+the process; nothing outlives the tab that answers it.
+
 Accepted, deliberately
 ----------------------
 
