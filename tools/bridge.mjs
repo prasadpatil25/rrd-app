@@ -248,7 +248,10 @@ async function handle(request, response) {
   // as an impression when it can be three numbers.
   const collected = (job.deliveredAt || arrived) - arrived;
   const answering = Date.now() - (job.deliveredAt || arrived);
-  console.log(`${request.method} ${job.path} -> machine ${machine}  ` +
+  // The token rides on the query string, so it must not ride into a log file
+  // that outlives the run and gets pasted into an issue.
+  const shown = job.path.replace(/([?&]token=)[^&]*/g, "$1<redacted>");
+  console.log(`${request.method} ${shown} -> machine ${machine}  ` +
               `[collected in ${collected}ms, answered in ${answering}ms]`);
 
   if (!answer || answer.error) {

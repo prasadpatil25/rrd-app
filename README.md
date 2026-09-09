@@ -120,12 +120,12 @@ disk, not a synthetic workload.
 ```
 for t in test test-engine test-device test-fs test-runner test-terminal \
          test-keyboard test-alpine test-sweep test-bisect test-nbd test-batch \
-         test-net test-publish test-lease test-gateway; do
+         test-net test-publish test-lease test-gateway test-idp; do
   node src/$t.mjs
 done
 ```
 
-881 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
+936 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
 the client half of the NBD protocol over a real socket, so the wire format and
 the server loop are exercised rather than mocked; the one hop that needs Linux
 is `nbd-client` binding the export to `/dev/nbd0`. `test-net.mjs` does the same
@@ -621,6 +621,97 @@ other address. The bridge listens on both loopback addresses now, and the same
 request takes **15 ms**. The lesson is the ordinary one: measure the stages
 before believing any story about which one is slow.
 
+## A test identity provider whose state is a commit
+
+Something to reach with the bridge, and the one OAuth-shaped thing this design
+is actually good at. `docs/oauth-test-idp.md` is the design note; this is how to
+run it.
+
+The idea in one line: **a test identity provider has no secret to protect**, and
+once that is true, every objection to running an authorization server in a
+browser tab disappears. The signing key is published on purpose -- committed, and
+served in the JWKS -- so a disk that cannot forget has nothing to remember, a
+tunnel in the clear carries nothing, and weak entropy costs nothing. What is left
+is the part worth having:
+
+> the IdP's clients, users and consent records have a version history, and can be
+> restored byte for byte from a reference.
+
+`mock-oauth2-server` gives you a fresh instance. Keycloak in Docker gives you a
+realm export that drifts from the tests needing it. Neither gives you *the IdP,
+exactly as it was at `cb9ac37`*.
+
+Three pieces, in three places, because they have three different requirements:
+
+| Piece | Requirement | Where |
+|---|---|---|
+| `jwks.json`, `.well-known/` | public, always up, no secret | the static host -- `idp-test/` |
+| `/authorize`, `/token` | a running machine, versioned state | the guest, as CGI |
+| signing, and the claims | a key, and a decision | the tab -- `app/idp.js` |
+
+Discovery lives on a static host and names endpoints that only exist while a tab
+is open, which sounds like a contradiction and is not: `iss` and `jwks_uri` are
+files in a repository and never move, while the endpoints point at the bridge. A
+test suite runs on the same computer as the machine it tests, so `localhost:9000`
+is a convention rather than an ephemeral tunnel name. **No tunnel is needed**,
+which is the whole difference between this and an authorization server.
+
+To run it, with a machine booted and `node tools/bridge.mjs` already listening:
+
+```js
+const idp = await import("./idp.js");
+idp.startSigner({ net: window.machine.net });          // the tab's half
+await idp.install(window.machine.run);                 // the guest's half
+```
+
+then serve it and connect the bridge:
+
+```
+rrd serve /disk/idp/www
+```
+
+```js
+const b = await import("./bridge-client.js");
+await b.connect({ net: window.machine.net });
+```
+
+and from curl, Postman, or a test suite -- an authorization code flow, PKCE, no
+client secret:
+
+```
+$ curl -s "localhost:9000/cgi-bin/authorize?response_type=code&client_id=test-client\
+&redirect_uri=urn:ietf:wg:oauth:2.0:oob&username=alice&code_challenge_method=S256\
+&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+urn:ietf:wg:oauth:2.0:oob?code=Yy1kR2Jsc0hxTXBaVXRu
+
+$ curl -s localhost:9000/cgi-bin/token -d grant_type=authorization_code \
+    -d code=Yy1kR2Jsc0hxTXBaVXRu -d client_id=test-client \
+    -d redirect_uri=urn:ietf:wg:oauth:2.0:oob \
+    -d code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk
+{"access_token":"eyJhbGciOiJFUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InRlc3Qta2V5...",
+ "id_token":"eyJhbGciOiJFUzI1NiIs...","token_type":"Bearer","expires_in":3600}
+```
+
+The tokens verify against `idp-test/jwks.json`, which a static host serves and
+which nothing has to be running to fetch. Omit `username` from the first request
+and it renders a form instead, so the same endpoint works from a browser.
+
+Then the part that is the point:
+
+```js
+const pinned = await restore({ host, branch: "idp-test", commit: "cb9ac37",
+                               manifestDigest: "<pinned>" });
+```
+
+`restore` refuses a state that is not the one pinned, and `src/core/bisect.js`
+answers the question no other test IdP can -- *which change to the fixture broke
+the login flow?*
+
+**The signing key in `app/idp.js` is public.** It is committed, it is in the
+JWKS, and anyone can forge any token this issues. The key id is
+`test-key-do-not-trust` and the issuer says `idp-test` so that a token which
+escapes into something real is obviously wrong. Point it at nothing that matters.
+
 ## Publishing a site to a static host
 
 Serving a machine reaches other tabs in one browser. Publishing reaches everyone,
@@ -784,6 +875,8 @@ src/core/lease.js    one writer at a time, on a ref of its own
 src/net/gateway.js   a way out, off by default and allowlisted when on
 net-sw.js       the worker that serves a machine, at the root so it can claim it
 app/control.js  the control plane the guest talks to; src/guest/control.js is its client
+app/idp.js      the test identity provider: the key, the claims, and the CGI it installs
+idp-test/       its JWKS and discovery document, served by the static host
 src/ui/         terminal renderer and keyboard mapping
 src/analysis/   the measurement harnesses behind the paper's tables
 traces/         captured write traces
