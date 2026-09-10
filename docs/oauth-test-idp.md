@@ -174,7 +174,14 @@ The skeleton exists. `README.md` has the commands; this is what is where.
 | `app/idp.js` | the key, `signJwt`, PKCE, the claims, the signer the guest calls, and `install` |
 | `idp-test/jwks.json` | the public half, for a static host |
 | `idp-test/.well-known/openid-configuration` | discovery |
-| `src/test-idp.mjs` | 55 assertions, no VM needed |
+| `app/check-idp.js` | the end-to-end check the UI button runs, a row per layer |
+| `src/test-idp.mjs` | 64 assertions, no VM needed |
+
+Four of them drive `check-idp.js` against a stand-in machine that is bent one
+way at a time -- a JWKS that disagrees with the signer, an IdP that hands out a
+second token for a spent code -- because a checker that only ever agrees with a
+working system is not evidence. The replay case is the one that matters: every
+other row stays green while it fails.
 
 Two of the tests are there for a failure this design is unusually likely to
 ship: the JWKS and the discovery document are static files that nothing at
@@ -186,18 +193,43 @@ PKCE is checked against the worked example in RFC 7636 appendix B rather than
 against this code's own output, which is the difference between testing an
 implementation and testing a specification.
 
+## Two origins, which were already there
+
+The machine is served from an origin of its own so that a site running in a
+guest cannot read the git token in the app's page. That split, adopted for a
+security reason with nothing to do with OAuth, turns out to be exactly the
+separation the protocol assumes:
+
+    :8001   the machine     the identity provider
+    :8000   the app page    the relying party
+
+So the sign-in page opens on the machine's origin and the `redirect_uri` points
+at the app's, and neither of those is a workaround: a redirect URI *is* the
+client's own address. `app/callback.html` is that address. It is a separate file
+rather than a route because a redirect URI has to be an exact registered string
+and a static host has no routes, and the URL is computed from `import.meta.url`
+at install time so the fixture is right on localhost and on a static host
+without being told which it is on.
+
+**The part that is not obvious.** The token exchange afterwards cannot be an
+ordinary cross-origin `fetch` from the app page to the machine. A service worker
+only receives `fetch` events for requests made by the clients *it controls*, and
+a page on the app's origin is not one of them -- the request would sail past the
+worker and reach the static server behind it, which knows nothing about any
+machine. A browser tab can *navigate* to a machine; it cannot *fetch* one. So
+the sign-in half travels as a navigation, which the worker does answer, and the
+exchange goes over the stack the tab already holds.
+
+That also settles a question worth not getting wrong twice: adding CORS headers
+to the token endpoint would not have helped, because nothing would have been
+there to send them.
+
 ## Open questions
 
 Not gaps to be embarrassed about -- things that must be decided, and are cheaper
-to decide now. Two from the first draft of this note are answered by the code and
-have been struck.
+to decide now. Three from the first draft of this note are answered -- two by the
+code, one by running it -- and have been struck.
 
-- **`Status:` from CGI.** New, and the one to check first. The authorize
-  endpoint returns a 302 by printing `Status: 302 Found`, which is what the CGI
-  specification says and what busybox httpd is believed to honour -- unverified
-  on a booted guest. The location is printed in the body as well, so if this
-  build does not translate it the caller can still see where it was meant to go.
-  That is a mitigation, not a fix; a real client follows the header.
 - **The lease.** A CI job restoring a pinned state is a reader, not an owner.
   `src/core/lease.js` assumes one writer at a time; a replay that takes the
   lease and dies takes the machine with it. Probably: restore without taking a
@@ -210,6 +242,26 @@ have been struck.
   one. That is right for a fixture and wrong for testing a failed login, which
   is a path some suites will want. A `password=` line in the user file and one
   comparison would do it.
+
+### Answered by running it
+
+- ~~**`Status:` from CGI.**~~ **busybox honours it.** Measured on a booted guest
+  through the bridge: `curl -i` on the authorize endpoint returns
+  `HTTP/1.1 302 Found` with a real `Location` header, not a 200. The location is
+  still printed in the body as well, which costs nothing and keeps the failure
+  legible if another build disagrees. `check-idp.js` reports which of the two it
+  saw rather than only whether a code arrived, so a build that stops honouring it
+  says so instead of going quiet.
+
+What it costs, measured end to end through the bridge on this machine:
+
+    authorize, a code issued          458 ms
+    token, a code exchanged and signed  616 ms
+    token, a replay refused           260 ms
+
+which is the fork-per-request cost the README already quotes for CGI under
+emulation, plus a signature. A login is under a second and a half. An
+integration test, not a unit test.
 
 ### Answered by building it
 

@@ -20,7 +20,8 @@
 import { readFileSync } from "node:fs";
 import {
   ALG, AUTHORIZE, CLIENTS, ISSUER, JWKS, KID, PRIVATE_JWK, PUBLIC_JWK, SIGNER_PORT,
-  TOKEN, USERS, base64url, issue, signJwt, startSigner, verifyChallenge
+  TOKEN, USERS, base64url, callbackUrl, install, issue, pkcePair, signJwt, startSigner,
+  verifyChallenge, verifyWithJwks
 } from "../app/idp.js";
 
 let passed = 0, failed = 0;
@@ -34,6 +35,21 @@ function eq(name, actual, expected) {
         `got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)}`);
 }
 
+const check_ = (name, ok, detail = "") => check(name, ok, detail);
+
+/**
+ * A real P-256 public key that is not the one that signs.
+ *
+ * Bending a coordinate of the real key instead gives a point that is not on the
+ * curve, and WebCrypto refuses it as malformed key material -- which is a
+ * different failure from "this signature was made by another key", and the
+ * second is the one a client actually meets.
+ */
+const STRANGER = {
+  kty: "EC", crv: "P-256", kid: "test-key-do-not-trust", alg: "ES256", use: "sig",
+  x: "dSKFplQK9b_Iyx9s1ttimqlQ5EM5c_eOKjq6HTnlr1g",
+  y: "vXLPfheVmvyNYmXWxgSEIeUgzI8FpFFevNt8RfvzZt0"
+};
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
 const claimsOf = (jwt) => JSON.parse(Buffer.from(jwt.split(".")[1], "base64url").toString("utf8"));
@@ -247,6 +263,222 @@ console.log("\nthe fixtures and the shell they are read by");
         TOKEN.includes(`:${SIGNER_PORT}`));
   check("authorize refuses anything but S256",
         AUTHORIZE.includes('[ "$method" = "S256" ]'));
+}
+
+// ------------------------------------------------------- the checker itself
+//
+// `check-idp.js` is what the UI button reports from, so it is worth knowing it
+// would notice a broken IdP rather than only agreeing with a working one. The
+// machine below is a stand-in: `run` answers the shell probes and `net.request`
+// answers the flow, and each case bends one thing and asks which row fails.
+//
+// The JWKS is fetched rather than imported by the real checker -- the failure
+// worth catching is the published file disagreeing with the signer -- so `fetch`
+// is stubbed here to serve whichever key the case wants.
+
+console.log("\nthe checker the button reports from");
+
+// Imported under another name: `check` here is the assertion helper.
+const { check: runCheck } = await import("../app/check-idp.js");
+
+function fakeMachine({ status302 = true, allowReplay = false, signWith = null } = {}) {
+  const codes = new Map();
+  const spent = new Set();
+  const answer = (status, body, headers = {}) => ({
+    status, headers, body: encoder.encode(body)
+  });
+
+  return {
+    async run(sent) {
+      // Enough of a console for `rc()`: the output, then the marker it waits for.
+      const out =
+        /ls .*clients/.test(sent) ? "test-client\nalice" :
+        /test -x/.test(sent) ? "" :
+        /cat .*codes/.test(sent) ? [...codes.entries()].map(([c, r]) =>
+            `client_id=test-client\nredirect_uri=urn:ietf:wg:oauth:2.0:oob\n` +
+            `challenge=${r.challenge}\nsub=alice\nscope=openid profile\nnonce=n-check`).join("") :
+        "";
+      return `${out}\nrc=0`;
+    },
+    net: {
+      ip: "10.0.2.2",
+      async request({ method = "GET", path, body }) {
+        const [route, query] = path.split("?");
+        const params = new URLSearchParams(query || "");
+
+        if (route === "/cgi-bin/authorize") {
+          if (!/^(urn:ietf:wg:oauth:2\.0:oob|http:\/\/localhost:8080\/callback)$/
+                .test(params.get("redirect_uri") || "")) {
+            return answer(400, "redirect_uri is not registered for test-client");
+          }
+          const code = "code" + (codes.size + 1);
+          codes.set(code, { challenge: params.get("code_challenge"),
+                            nonce: params.get("nonce") || "" });
+          const location = `${params.get("redirect_uri")}?code=${code}`;
+          return status302
+            ? answer(302, location, { location })
+            : answer(200, location);          // busybox did not honour Status:
+        }
+
+        if (route === "/cgi-bin/token" && method === "POST") {
+          const fields = new URLSearchParams(decoder.decode(body));
+          const code = fields.get("code");
+          const record = codes.get(code);
+          const err = (e, d) => answer(400, JSON.stringify({ error: e, error_description: d }));
+          if (!record) return err("invalid_grant", "no such code, or it has already been used");
+          if (spent.has(code) && !allowReplay) {
+            return err("invalid_grant", "no such code, or it has already been used");
+          }
+          spent.add(code);
+          if (!(await verifyChallenge(fields.get("code_verifier"), record.challenge))) {
+            return err("invalid_grant", "the code_verifier does not match the code_challenge");
+          }
+          const tokens = await issue({
+            sub: "alice", aud: "test-client", scope: "openid profile",
+            nonce: record.nonce, name: "Alice Example", email: "alice@example.test"
+          });
+          return answer(200, JSON.stringify(tokens));
+        }
+        return answer(404, "not found");
+      }
+    }
+  };
+}
+
+/** Serve a chosen JWKS to the checker, the way the static host would. */
+function withJwks(keys, fn) {
+  const real = globalThis.fetch;
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ keys }) });
+  return fn().finally(() => { globalThis.fetch = real; });
+}
+
+const rowOf = (report, name) => report.rows.find((r) => r.check.includes(name));
+
+{
+  const report = await withJwks(JWKS.keys, () => runCheck(fakeMachine()));
+  check_("a working IdP passes every row", report.ok,
+         JSON.stringify(report.rows.filter((r) => !r.ok).map((r) => r.check + ": " + r.detail)));
+  check_("and it did verify a real signature, not skip the check",
+         rowOf(report, "verifies against the published JWKS").ok);
+  check_("and it checked the refusals too",
+         report.rows.filter((r) => r.layer === "refusals").length === 3);
+}
+{
+  // The open question, seen from the checker: the flow still works, so this must
+  // not fail -- but it must say so, or the finding is invisible.
+  const report = await withJwks(JWKS.keys, () => runCheck(fakeMachine({ status302: false })));
+  check_("a busybox that ignores Status: does not fail the run", report.ok);
+  check_("but the row says a redirect-following client would not see the code",
+         /not 302/.test(rowOf(report, "authorize issues a code").detail),
+         rowOf(report, "authorize issues a code").detail);
+}
+{
+  // The failure this design is most likely to ship: a published JWKS that is not
+  // the key that signs. Everything else about the IdP works.
+  const report = await withJwks([STRANGER], () => runCheck(fakeMachine()));
+  check_("a JWKS that disagrees with the signer fails", !report.ok);
+  check_("and it is the token row that names it",
+         rowOf(report, "verifies against the published JWKS").ok === false);
+}
+{
+  // An IdP that hands out a second token for a spent code. Every other row is
+  // green, which is exactly why a checker that stopped at the happy path lies.
+  const report = await withJwks(JWKS.keys, () => runCheck(fakeMachine({ allowReplay: true })));
+  check_("an IdP that allows replay fails", !report.ok);
+  check_("and it is the replay row that names it",
+         rowOf(report, "spent code cannot be spent again").ok === false);
+}
+
+// ------------------------------------------------- signing in from the app
+
+console.log("\nthe pieces the Sign in button is built from");
+{
+  const { verifier, challenge } = await pkcePair();
+  check_("a generated pair satisfies its own challenge", await verifyChallenge(verifier, challenge));
+  const other = await pkcePair();
+  check_("two pairs are not the same pair", verifier !== other.verifier);
+  check_("the challenge is not the verifier", verifier !== challenge);
+  check_("neither carries a character that would need escaping in a query string",
+         !/[+/=&?#]/.test(verifier + challenge));
+}
+{
+  const jwt = await signJwt({ sub: "alice", iss: ISSUER });
+  const { header, claims } = await verifyWithJwks(jwt, JWKS.keys);
+  eq("a good token verifies and gives back its claims", claims.sub, "alice");
+  eq("and its header", header.kid, KID);
+}
+{
+  // The check a client actually depends on, from the other side: a token this
+  // module could verify against its own key must still fail against a JWKS that
+  // is not the signer's.
+  const jwt = await signJwt({ sub: "alice" });
+  const wrong = [STRANGER];
+  let message = "";
+  try { await verifyWithJwks(jwt, wrong); } catch (err) { message = err.message; }
+  check_("a JWKS that is not the signer's is refused", /do not verify|does not verify/.test(message), message);
+
+  message = "";
+  try { await verifyWithJwks(jwt, [{ ...PUBLIC_JWK, kid: "someone-else" }]); }
+  catch (err) { message = err.message; }
+  check_("and a JWKS with no matching kid says so", /kid/.test(message), message);
+
+  message = "";
+  try { await verifyWithJwks("not-a-jwt", JWKS.keys); } catch (err) { message = err.message; }
+  check_("and something that is not a JWT at all", /not a JWT/.test(message), message);
+}
+{
+  const url = callbackUrl();
+  check_("the callback is a real absolute URL", /^[a-z]+:\/\//.test(url), url);
+  check_("on the app's own origin, beside idp.js", url.endsWith("/app/callback.html"), url);
+}
+
+// ------------------------------------------- what install writes, without a VM
+//
+// `install` only talks to the guest through `rc`, so a recorder in its place is
+// enough to see what would land on the disk. Two things are worth knowing
+// without booting: that the callback URL -- the one part of the fixture that is
+// computed rather than written down -- actually reaches the client file, and
+// that a directory already holding somebody's site keeps its own index.
+
+console.log("\nwhat install writes");
+
+function recorder({ indexExists }) {
+  const commands = [];
+  const rc = async (_run, command) => {
+    commands.push(command);
+    if (/^test -f .*index\.html$/.test(command)) return { ok: indexExists, code: indexExists ? 0 : 1, output: "" };
+    return { ok: true, code: 0, output: "" };
+  };
+  return { fs: { rc }, commands,
+           writtenTo: (path) => commands.filter((c) => c.endsWith(` ${path}`) || c.endsWith(`> ${path}`) ||
+                                                       c.includes(`> ${path}`)).join("\n") };
+}
+
+{
+  const rec = recorder({ indexExists: false });
+  const where = await install(null, { fs: rec.fs });
+  eq("it reports where the fixtures went", where.root, "/disk/idp");
+  const client = rec.writtenTo("/disk/idp/clients/test-client");
+  check_("the client fixture carries the computed callback URL",
+         client.includes(callbackUrl()), client.slice(0, 200));
+  for (const fixed of CLIENTS["test-client"]) {
+    check_(`and still carries the written-down ${fixed}`, client.includes(fixed));
+  }
+  check_("the users are written", !!rec.writtenTo("/disk/idp/users/alice"));
+  check_("an empty directory gets a landing page",
+         rec.commands.some((c) => c.includes("> /disk/idp/www/index.html")));
+  check_("and the CGI is made executable",
+         rec.commands.includes("chmod +x /disk/idp/www/cgi-bin/authorize"));
+}
+{
+  // The rule the Serve button follows, and the reason the button can install
+  // into /disk/www without eating the demo site.
+  const rec = recorder({ indexExists: true });
+  await install(null, { fs: rec.fs, directory: "/disk/www" });
+  check_("a directory that already has an index keeps it",
+         !rec.commands.some((c) => c.includes("> /disk/www/index.html")));
+  check_("but the endpoints still go in",
+         rec.commands.includes("chmod +x /disk/www/cgi-bin/token"));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -885,11 +885,185 @@ $("serveBtn").addEventListener("click", async () => {
     });
     serveStatus(`Serving ${directory} at ${serving.url} — open it in another tab. ` +
                 `Inside the machine, "rrd help" lists what it can do from there.`, "ok");
-    enable(["unserveBtn"], true);
+    enable(["unserveBtn", "idpBtn"], true);
+    idpStatus("Ready. This installs an IdP onto the disk and runs a full flow against it.");
   } catch (err) {
     serveStatus(err.message, "bad");
     enable(["serveBtn"], true);
   }
+});
+
+function idpWho(message, kind = "idle") {
+  const el = $("idpWho");
+  el.textContent = message;
+  el.className = `status ${kind}`;
+}
+
+/**
+ * Sign in, as a person would.
+ *
+ * The machine is the identity provider and this page is the client, and they are
+ * on different origins already -- which is the arrangement OAuth assumes and the
+ * arrangement this project adopted for its own reasons. So the sign-in page
+ * opens on the machine's origin, and the code comes back here, to a callback
+ * that is a real registered address on this one.
+ *
+ * The exchange afterwards goes over the tab's own stack rather than a fetch to
+ * the machine's origin, and that is not laziness: a service worker only answers
+ * for the clients it controls, so a fetch from this page to the machine's origin
+ * would sail past the worker and hit the static server behind it. A browser tab
+ * can navigate to a machine; it cannot fetch one.
+ */
+$("idpLoginBtn").addEventListener("click", async () => {
+  enable(["idpLoginBtn"], false);
+  let listener = null;
+  let popup = null;
+  try {
+    const session = idpSession();
+    if (!session) throw new Error("no machine is running");
+    const machineUrl = (window.machine && window.machine.url) || (serving && serving.url);
+    if (!machineUrl) throw new Error("the machine has no origin of its own to sign in on");
+
+    const idp = await import("./idp.js");
+    const { verifier, challenge } = await idp.pkcePair();
+    const state = idp.base64url(crypto.getRandomValues(new Uint8Array(12)));
+    const nonce = idp.base64url(crypto.getRandomValues(new Uint8Array(12)));
+    const redirect = idp.callbackUrl();
+
+    const authorize = new URL("cgi-bin/authorize", machineUrl);
+    authorize.search = new URLSearchParams({
+      response_type: "code", client_id: "test-client", redirect_uri: redirect,
+      scope: "openid profile email", state, nonce,
+      code_challenge: challenge, code_challenge_method: "S256"
+    });
+
+    idpWho("Waiting for the sign-in window...", "idle");
+    popup = window.open(authorize, "rrd-idp-login", "width=520,height=620");
+    if (!popup) throw new Error("the sign-in window was blocked; allow popups for this page");
+
+    const back = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("nobody signed in within two minutes")), 120000);
+      listener = (event) => {
+        // Same origin only, and our own message shape: this page has a token in
+        // it, and a message handler is something any site can reach.
+        if (event.origin !== location.origin) return;
+        if (!event.data || event.data.source !== "rrd-idp-callback") return;
+        clearTimeout(timer);
+        resolve(event.data);
+      };
+      addEventListener("message", listener);
+    });
+
+    if (back.error) throw new Error(`${back.error}${back.errorDescription ? ": " + back.errorDescription : ""}`);
+    if (back.state !== state) throw new Error("the state that came back is not the one that went out");
+    if (!back.code) throw new Error("no code came back");
+
+    idpWho("Exchanging the code...", "idle");
+    const response = await session.net.request({
+      port: 80, method: "POST", path: "/cgi-bin/token",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new TextEncoder().encode(new URLSearchParams({
+        grant_type: "authorization_code", code: back.code, client_id: "test-client",
+        redirect_uri: redirect, code_verifier: verifier
+      }).toString())
+    });
+    const tokens = JSON.parse(new TextDecoder().decode(response.body));
+    if (tokens.error) throw new Error(`${tokens.error}: ${tokens.error_description || ""}`);
+
+    const { keys } = await (await fetch(new URL("../idp-test/jwks.json", import.meta.url))).json();
+    const { claims } = await idp.verifyWithJwks(tokens.id_token, keys);
+    if (claims.nonce !== nonce) throw new Error("the nonce did not survive: this token answers another request");
+
+    idpWho(`Signed in as ${claims.name || claims.sub}` +
+           `${claims.email ? ` (${claims.email})` : ""}. Verified against the JWKS this site serves. ` +
+           `The key is public, so this proves nothing — which is the point.`, "ok");
+    log(`signed in as ${claims.sub}, token verified against the published JWKS`);
+  } catch (err) {
+    idpWho(err.message, "bad");
+    log(err.message, "bad");
+  } finally {
+    if (listener) removeEventListener("message", listener);
+    if (popup && !popup.closed) popup.close();
+    enable(["idpLoginBtn"], true);
+  }
+});
+
+function idpStatus(message, kind = "idle") {
+  const el = $("idpStatus");
+  el.textContent = message;
+  el.className = `status ${kind}`;
+}
+
+/**
+ * Whichever machine is running, in the shape the checks want.
+ *
+ * There are two ways to have one and they carry it differently: /app/?serve
+ * builds its own emulator inside demo-serve.js and leaves the session on
+ * window.machine, while the Serve button drives this page's emulator through
+ * guestRun. Both end up with a runner and a stack, which is all that is needed.
+ */
+function idpSession() {
+  if (window.machine && window.machine.run && window.machine.net) {
+    return { run: window.machine.run, net: window.machine.net,
+             directory: window.machine.directory || "/disk/www" };
+  }
+  if (serving && serving.net) {
+    return { run: guestRun, net: serving.net, directory: serving.directory || "/disk/www" };
+  }
+  return null;
+}
+
+let signer = null;
+
+$("idpBtn").addEventListener("click", async () => {
+  enable(["idpBtn"], false);
+  try {
+    const session = idpSession();
+    if (!session) {
+      throw new Error("serve a directory first: the endpoints are CGI, and something has to run them");
+    }
+
+    const idp = await import("./idp.js");
+
+    // Once per tab. Starting it twice would try to listen on a port the stack
+    // is already listening on, which throws rather than quietly replacing it.
+    if (!signer) {
+      signer = idp.startSigner({
+        net: session.net,
+        onEvent: (e) => log(`idp signer: ${e.type}${e.sub ? ` ${e.sub}` : ""}` +
+                            `${e.reason ? ` (${e.reason})` : ""}${e.error ? ` ${e.error}` : ""}`,
+                            e.type === "failed" ? "bad" : "")
+      });
+      log(`the signer is listening on ${session.net.ip}:${signer.port}. Its key is public on purpose.`);
+    }
+
+    idpStatus("Installing the identity provider onto the disk...", "idle");
+    const where = await idp.install(session.run, { directory: session.directory });
+    $("idpState").className = "mountstate on";
+    $("idpState").textContent = "installed";
+    enable(["idpLoginBtn"], true);
+    log(`identity provider: fixtures in ${where.root}, endpoints in ${where.directory}/cgi-bin`);
+
+    idpStatus("Running an authorization code flow against it...", "idle");
+    const { check } = await import("./check-idp.js");
+    const report = await check(session, { directory: session.directory, root: where.root });
+
+    for (const row of report.rows) {
+      log(`idp ${row.ok ? "ok  " : "FAIL"} ${row.layer}: ${row.check} - ${row.detail}`,
+          row.ok === false ? "bad" : "");
+    }
+
+    const failed = report.rows.filter((row) => row.ok === false);
+    idpStatus(failed.length
+      ? `${failed[0].layer}: ${failed[0].check} - ${failed[0].detail}`
+      : `The whole flow works. ${report.rows.length} checks: a code issued and spent once, ` +
+        `a token signed in this tab and verified against the JWKS this site serves as a file.`,
+      failed.length ? "bad" : "ok");
+  } catch (err) {
+    idpStatus(err.message, "bad");
+    log(err.message, "bad");
+  }
+  enable(["idpBtn"], true);
 });
 
 $("unserveBtn").addEventListener("click", async () => {
@@ -898,6 +1072,10 @@ $("unserveBtn").addEventListener("click", async () => {
     if (serving) await serving.stop();
     serving = null;
     serveStatus("Not serving. The disk is untouched.", "idle");
+    // The endpoints are CGI: with nothing serving them there is nothing to test,
+    // though what was installed stays on the disk.
+    enable(["idpBtn", "idpLoginBtn"], false);
+    idpStatus("Not serving, so there is nothing running the endpoints.", "idle");
   } catch (err) {
     serveStatus(err.message, "bad");
   }
@@ -925,7 +1103,8 @@ async function autoServe() {
     // anyone reaches for when something looks wrong, and the check takes a while.
     window.machine = session;
     serving = { url: session.url, stop: () => session.stop() };
-    enable(["unserveBtn"], true);
+    enable(["unserveBtn", "idpBtn"], true);
+    idpStatus("Ready. This installs an IdP onto the disk and runs a full flow against it.");
 
     panel.className = "status ok";
     panel.textContent = "";

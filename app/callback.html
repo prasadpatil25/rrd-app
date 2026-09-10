@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signed in</title>
+<!--
+  Where the machine sends the browser back to after a sign-in.
+
+  THIS PAGE IS ON THE ORIGIN THE GIT TOKEN LIVES ON. It does one thing: read the
+  code out of its own query string, hand it to whatever opened it, and close. It
+  must never read storage, never fetch, and never grow a feature -- the whole
+  reason a machine is served from a second origin is that this one is where the
+  token is, and a callback is the one page an outside site can cause to load.
+
+  The code it carries is worth nothing on its own: it is single-use and bound to
+  a PKCE verifier this page has never seen.
+
+  It is a separate file rather than a route in the app because a redirect URI has
+  to be an exact registered address, and a static host has no routes.
+-->
+<style>
+  body { font: 15px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+         max-width: 52ch; margin: 12vh auto; padding: 0 20px;
+         background: #EFF2F1; color: #131C1A }
+  h1 { font-size: 18px; margin: 0 0 6px }
+  p { color: #4A5754; margin: 0 0 10px }
+  code { background: #E1E7E5; padding: 1px 4px; border-radius: 3px }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0D1412; color: #E1E9E6 }
+    p { color: #7E8C88 } code { background: #1E2A27 }
+  }
+</style>
+</head>
+<body>
+<h1 id="head">Signed in</h1>
+<p id="note">Handing the result back to the app. This window closes itself.</p>
+<script>
+(() => {
+  const params = new URLSearchParams(location.search);
+  const message = {
+    source: "rrd-idp-callback",
+    code: params.get("code"),
+    state: params.get("state"),
+    error: params.get("error"),
+    errorDescription: params.get("error_description")
+  };
+
+  if (message.error) {
+    document.getElementById("head").textContent = "Refused";
+    document.getElementById("note").textContent =
+      message.error + (message.errorDescription ? ": " + message.errorDescription : "");
+  }
+
+  // Same origin, named explicitly rather than "*": the opener is the app page,
+  // and a wildcard would post this to whatever else managed to open us.
+  if (window.opener) {
+    window.opener.postMessage(message, location.origin);
+    if (!message.error) setTimeout(() => window.close(), 300);
+    return;
+  }
+
+  document.getElementById("head").textContent = "Nothing opened this";
+  document.getElementById("note").innerHTML =
+    "This is the callback for the test identity provider. Nothing opened it, so " +
+    "there is nobody to hand the result to. Start from the app's " +
+    "<code>Identity provider</code> panel.";
+})();
+</script>
+</body>
+</html>

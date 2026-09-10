@@ -138,6 +138,62 @@ export async function verifyChallenge(verifier, challenge) {
   return base64url(new Uint8Array(digest)) === challenge;
 }
 
+/** A fresh PKCE pair. S256, which is the only method this accepts. */
+export async function pkcePair() {
+  const verifier = base64url(crypto.getRandomValues(new Uint8Array(32)));
+  const digest = await crypto.subtle.digest("SHA-256", encoder.encode(verifier));
+  return { verifier, challenge: base64url(new Uint8Array(digest)) };
+}
+
+function bytesFromBase64url(text) {
+  const binary = atob(String(text).replace(/-/g, "+").replace(/_/g, "/"));
+  const out = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+  return out;
+}
+
+const segment = (text) => new TextDecoder().decode(bytesFromBase64url(text));
+
+/**
+ * Verify a token the way a client does: against keys it fetched, not the key in
+ * this module.
+ *
+ * Checking a signature against the key that made it proves nothing about the
+ * JWKS a client would actually use, and those disagreeing is the failure this
+ * design is most likely to ship -- it would work perfectly on the machine that
+ * wrote both.
+ */
+export async function verifyWithJwks(jwt, keys) {
+  const [head, payload, signature] = String(jwt).split(".");
+  if (!signature) throw new Error("that is not a JWT");
+  const header = JSON.parse(segment(head));
+  const jwk = (keys || []).find((k) => k.kid === header.kid);
+  if (!jwk) throw new Error(`the JWKS has no key with kid ${header.kid}`);
+  const key = await crypto.subtle.importKey(
+    "jwk", { kty: jwk.kty, crv: jwk.crv, x: jwk.x, y: jwk.y },
+    { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]
+  );
+  const valid = await crypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" }, key,
+    bytesFromBase64url(signature), encoder.encode(`${head}.${payload}`)
+  );
+  if (!valid) throw new Error("the signature does not verify: the JWKS and the signer disagree");
+  return { header, claims: JSON.parse(segment(payload)) };
+}
+
+/**
+ * Where the browser comes back to after signing in.
+ *
+ * The app's own origin, not the machine's -- which is not a concession to the
+ * origin split but the thing a redirect URI is: the client's own address, and
+ * the client here is the page holding the tab. Computed rather than written
+ * down, so it is right on localhost and on a static host without being told
+ * which one it is on.
+ */
+export function callbackUrl() {
+  return new URL("callback.html", import.meta.url).href;
+}
+
 /**
  * Build and sign the token response.
  *
@@ -268,15 +324,24 @@ export async function install(run, {
 
   await rc(run, `mkdir -p ${root}/clients ${root}/users ${root}/codes ${directory}/cgi-bin`, timeoutMs);
 
+  // The app page is a client too, and its address is only knowable at runtime.
+  // Everything else in the fixture is written down; this one is computed, which
+  // is why it is added here rather than in CLIENTS.
+  const callback = callbackUrl();
   for (const [id, redirects] of Object.entries(CLIENTS)) {
-    await writeFile(rc, run, `${root}/clients/${id}`, redirects.join("\n"), timeoutMs);
+    const all = redirects.includes(callback) ? redirects : [...redirects, callback];
+    await writeFile(rc, run, `${root}/clients/${id}`, all.join("\n"), timeoutMs);
   }
   for (const [name, profile] of Object.entries(USERS)) {
     await writeFile(rc, run, `${root}/users/${name}`,
                     `name=${profile.name}\nemail=${profile.email}`, timeoutMs);
   }
 
-  await writeFile(rc, run, `${directory}/index.html`, INDEX, timeoutMs);
+  // Only when the directory has no page of its own. Installing into a directory
+  // that is already serving somebody's site must not replace their index with a
+  // landing page for this one -- the same rule the Serve button follows.
+  const present = await rc(run, `test -f ${directory}/index.html`, timeoutMs);
+  if (!present.ok) await writeFile(rc, run, `${directory}/index.html`, INDEX, timeoutMs);
 
   for (const [name, script] of [["authorize", AUTHORIZE], ["token", TOKEN]]) {
     const path = `${directory}/cgi-bin/${name}`;

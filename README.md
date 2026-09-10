@@ -125,7 +125,7 @@ for t in test test-engine test-device test-fs test-runner test-terminal \
 done
 ```
 
-936 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
+966 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
 the client half of the NBD protocol over a real socket, so the wire format and
 the server loop are exercised rather than mocked; the one hop that needs Linux
 is `nbd-client` binding the export to `/dev/nbd0`. `test-net.mjs` does the same
@@ -656,7 +656,26 @@ test suite runs on the same computer as the machine it tests, so `localhost:9000
 is a convention rather than an ephemeral tunnel name. **No tunnel is needed**,
 which is the whole difference between this and an authorization server.
 
-To run it, with a machine booted and `node tools/bridge.mjs` already listening:
+The quickest way to see it work is the **Identity provider** panel: press *Install
+and test* once something is being served, and it installs the IdP onto the disk
+and runs a whole authorization code flow against it -- a code issued, exchanged
+with PKCE, the token verified against the JWKS this site serves as a static file,
+then the code replayed and the verifier corrupted to check the refusals. It
+reports a row per layer, so the first failure names the layer rather than the
+symptom. That path needs no bridge and no node process: it goes through the tab's
+own stack into busybox, which is the same path a curl would take minus the socket.
+
+Beside it is **Sign in**, which is the same flow with a person in it: a window
+opens on the *machine's* origin showing its own login page, you pick a user, and
+the code comes back to a callback on the *app's* origin. Both halves are real,
+and so is the separation between them -- the machine is the identity provider,
+this page is the client, and they have been on different origins since long
+before there was an IdP, because that is what keeps a site in a guest away from
+the git token. The protocol's boundary and the project's turn out to be the same
+line. It takes about a second, and needs no bridge either.
+
+For curl and Postman you do need the bridge. With a machine booted and
+`node tools/bridge.mjs` already listening:
 
 ```js
 const idp = await import("./idp.js");
@@ -693,8 +712,45 @@ $ curl -s localhost:9000/cgi-bin/token -d grant_type=authorization_code \
 ```
 
 The tokens verify against `idp-test/jwks.json`, which a static host serves and
-which nothing has to be running to fetch. Omit `username` from the first request
+which nothing has to be running to fetch. Measured through the bridge: 458 ms to
+issue a code, 616 ms to exchange one and sign the tokens -- the fork-per-request
+cost above, plus a signature. Omit `username` from the first request
 and it renders a form instead, so the same endpoint works from a browser.
+
+### Logging in with it
+
+`tools/idp-login.mjs` is the client half, and the shortest honest demonstration
+of an identity provider is somebody logging in. It makes a PKCE pair, sends a
+browser to the machine, catches the callback on `:8080`, exchanges the code and
+verifies the token against the JWKS -- then prints who signed in.
+
+```
+node tools/idp-login.mjs                # opens a browser, pick a user
+node tools/idp-login.mjs --user alice   # no browser, for a script or CI
+```
+
+```
+  signed in
+
+    subject     alice
+    name        Alice Example
+    email       alice@example.test
+    issuer      https://prasadpatil25.github.io/rrd-app/idp-test
+    audience    test-client
+    expires     2026-09-10T00:26:52.000Z
+
+  the id_token verified against http://localhost:8000/idp-test/jwks.json
+  and that key is public, so this proves nothing at all.
+```
+
+It checks the things a demonstration usually generates and then ignores: the
+`state` has to come back unchanged, the `nonce` has to be in the token, the
+audience has to be this client, and the signature has to verify against the
+published key rather than the one in memory. `--no-open` prints the URL instead
+of opening a browser, for a machine with no browser to open.
+
+It needs the bridge, and says so rather than timing out if it is not there --
+nothing outside the tab can reach a machine without one.
 
 Then the part that is the point:
 
@@ -876,6 +932,9 @@ src/net/gateway.js   a way out, off by default and allowlisted when on
 net-sw.js       the worker that serves a machine, at the root so it can claim it
 app/control.js  the control plane the guest talks to; src/guest/control.js is its client
 app/idp.js      the test identity provider: the key, the claims, and the CGI it installs
+app/check-idp.js  the flow, end to end, a row per layer; app/check-serve.js is its model
+app/callback.html    where a sign-in comes back to: the client's address, on the app's origin
+tools/idp-login.mjs  the client half: a real login, in one command
 idp-test/       its JWKS and discovery document, served by the static host
 src/ui/         terminal renderer and keyboard mapping
 src/analysis/   the measurement harnesses behind the paper's tables

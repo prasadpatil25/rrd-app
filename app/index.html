@@ -357,6 +357,28 @@ code { background: var(--code-bg); padding: .1em .35em; border-radius: 3px; }
 </section>
 
 <section class="panel">
+  <header>
+    <h2>Identity provider</h2>
+    <p>Install an OAuth test identity provider onto the machine's disk and run an authorization
+    code flow against it, end to end: a code is issued, exchanged with PKCE, and the token that
+    comes back is verified against the JWKS this site serves as a static file. Its clients and
+    users are files on the disk, so they have a version history like everything else on it.
+    <strong>The signing key is public</strong> &mdash; it is committed and served in the JWKS, so
+    anyone can forge any token this issues. That is what makes it safe to keep in a repository
+    and what makes it useless for anything real.</p>
+  </header>
+  <div class="row">
+    <button id="idpBtn" disabled>Install and test</button>
+    <button class="ghost" id="idpLoginBtn" disabled>Sign in</button>
+    <span class="mountstate" id="idpState">not installed</span>
+  </div>
+  <p class="status idle" id="idpStatus">Serve a directory first &mdash; the endpoints are CGI, and something has to be serving them.</p>
+  <p class="status idle" id="idpWho">Sign in opens the machine&rsquo;s own login page, on the machine&rsquo;s own origin, in a
+  second window. The code comes back to this page because this page is the client &mdash; which is what the
+  two origins were already for.</p>
+</section>
+
+<section class="panel">
   <header><h2>Log</h2></header>
   <div class="log" id="log" data-empty="1">waiting.</div>
 </section>
