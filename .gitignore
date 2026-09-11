@@ -32,3 +32,9 @@ Thumbs.db
 *.bak
 *.orig
 *~
+
+# Where tools/fake-github.mjs keeps the script it runs and the codes it has
+# issued. It removes this on the way out, so a copy left behind means a run that
+# was killed rather than stopped -- and the fixtures in it are rewritten from
+# app/idp.js on every start, so there is never anything here worth keeping.
+.fake-github*/

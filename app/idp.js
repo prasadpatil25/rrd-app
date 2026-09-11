@@ -322,7 +322,9 @@ export async function install(run, {
 } = {}) {
   const rc = fs ? fs.rc : (await import("../src/guest/fs.js")).rc;
 
-  await rc(run, `mkdir -p ${root}/clients ${root}/users ${root}/codes ${directory}/cgi-bin`, timeoutMs);
+  await rc(run, `mkdir -p ${root}/clients ${root}/users ${root}/codes ` +
+                `${root}/gh-clients ${root}/device ${root}/gh-codes ` +
+                `${directory}/cgi-bin`, timeoutMs);
 
   // The app page is a client too, and its address is only knowable at runtime.
   // Everything else in the fixture is written down; this one is computed, which
@@ -331,6 +333,12 @@ export async function install(run, {
   for (const [id, redirects] of Object.entries(CLIENTS)) {
     const all = redirects.includes(callback) ? redirects : [...redirects, callback];
     await writeFile(rc, run, `${root}/clients/${id}`, all.join("\n"), timeoutMs);
+  }
+  // The fake GitHub's apps. Nothing here is computed: unlike the IdP's own
+  // client, whose callback is the page's address and therefore only knowable
+  // at runtime, a bridge is reached at a port that is written down.
+  for (const [id, client] of Object.entries(GITHUB_CLIENTS)) {
+    await writeFile(rc, run, `${root}/gh-clients/${id}`, githubClientFile(client), timeoutMs);
   }
   for (const [name, profile] of Object.entries(USERS)) {
     await writeFile(rc, run, `${root}/users/${name}`,
@@ -343,7 +351,8 @@ export async function install(run, {
   const present = await rc(run, `test -f ${directory}/index.html`, timeoutMs);
   if (!present.ok) await writeFile(rc, run, `${directory}/index.html`, INDEX, timeoutMs);
 
-  for (const [name, script] of [["authorize", AUTHORIZE], ["token", TOKEN]]) {
+  for (const [name, script] of [["authorize", AUTHORIZE], ["token", TOKEN],
+                                ["github", GITHUB]]) {
     const path = `${directory}/cgi-bin/${name}`;
     await writeFile(rc, run, path, script.replace(/__ROOT__/g, root), timeoutMs);
     const marked = await rc(run, `chmod +x ${path}`, timeoutMs);
@@ -353,7 +362,8 @@ export async function install(run, {
   return {
     root, directory,
     authorize: `${directory}/cgi-bin/authorize`,
-    token: `${directory}/cgi-bin/token`
+    token: `${directory}/cgi-bin/token`,
+    github: `${directory}/cgi-bin/github`
   };
 }
 
@@ -556,4 +566,428 @@ echo "Content-Type: application/json"
 echo "Cache-Control: no-store"
 echo
 printf '%s\\n' "$answer"
+`;
+
+// --- GitHub, in the shape a client meets it ---------------------------------
+//
+// The other half of this file is an identity provider. This half is a stand-in
+// for somebody else's, and it exists because `src/host/device-flow.js` had no
+// way to be tested against an HTTP server at all: its tests inject a `fetch`,
+// which proves the state machine and nothing about the wire.
+//
+// THE CLIENT SECRET BELOW IS PUBLIC, for the same reason the signing key above
+// is, and the reasoning transfers exactly: a fake GitHub has nothing to protect.
+// A secret that guards a token endpoint which hands out strings beginning
+// `ghu_` and meaning nothing is not a secret, and saying so here is what keeps
+// anyone from mistaking this for a way to hold a real one.
+//
+// Point a bridge at it:
+//
+//   node tools/bridge.mjs --github-client-id Iv1.test-client-do-not-trust \
+//                         --github-base http://127.0.0.1:9100
+
+/**
+ * Registered apps. `device: false` is an app whose owner never ticked the
+ * device flow box, which is the first wall anyone setting this up walks into
+ * and the one GitHub describes worst.
+ */
+export const GITHUB_CLIENTS = {
+  "Iv1.test-client-do-not-trust": {
+    secret: "test-client-secret-do-not-trust",
+    device: true,
+    callbacks: [
+      "http://127.0.0.1:9000/_bridge/github/callback",
+      "urn:ietf:wg:oauth:2.0:oob"
+    ]
+  },
+  "Iv1.no-device-flow": {
+    secret: "test-client-secret-do-not-trust",
+    device: false,
+    callbacks: ["http://127.0.0.1:9000/_bridge/github/callback"]
+  }
+};
+
+/** One client as the file the CGI looks it up in. */
+export function githubClientFile(client) {
+  return [
+    `secret=${client.secret}`,
+    `device=${client.device ? "on" : "off"}`,
+    ...client.callbacks.map((url) => `callback=${url}`)
+  ].join("\n");
+}
+
+export const GITHUB = `#!/bin/sh
+# GitHub's OAuth endpoints, in the shape a client meets them.
+#
+# Not an identity provider: it issues no JWT and signs nothing, because a GitHub
+# token is opaque and the client under test never looks inside one. That is why
+# this needs no help from the tab, unlike the token endpoint beside it.
+#
+# What it is for is the wall. github.com sends no CORS headers, so the only
+# client that can finish a flow against it is one outside a browser -- and the
+# only way to test that client was to register an app, type a code, and wait.
+# Point it here with --github-base instead: the paths, the errors and the two
+# encodings are GitHub's, and nothing about it is a secret.
+BB=\${RRD_BUSYBOX:-/disk/usr/local/bin/busybox}
+IDP=\${RRD_IDP:-__ROOT__}
+DEV=$IDP/device
+GHC=$IDP/gh-codes
+
+mkdir -p "$DEV" "$GHC" 2>/dev/null
+
+# Which endpoint. busybox httpd puts whatever followed the script name into
+# PATH_INFO; when a host does not, the request line still carries it.
+route=$PATH_INFO
+if [ -z "$route" ]; then
+  route=$(printf '%s' "$REQUEST_URI" | sed -e 's/?.*//' -e 's#^.*/cgi-bin/github##')
+fi
+
+# A token request is a POST form. Accept a query string too: that is what a
+# person testing an endpoint by hand reaches for first.
+params=$QUERY_STRING
+if [ -n "$CONTENT_LENGTH" ] && [ "$CONTENT_LENGTH" -gt 0 ] 2>/dev/null; then
+  params=$($BB head -c "$CONTENT_LENGTH")
+fi
+
+field() { echo "$params" | tr '&' '\\n' | grep "^$1=" | head -n 1 | cut -d= -f2-; }
+decode() { $BB httpd -d "$(printf '%s' "$1" | tr '+' ' ')"; }
+esc() { $BB httpd -e "$*"; }
+enc() { printf '%s' "$1" | sed -e 's/%/%25/g' -e 's/ /%20/g' -e 's/&/%26/g' -e 's/?/%3F/g' -e 's/#/%23/g' -e 's/+/%2B/g'; }
+safe() { printf '%s' "$1" | tr -cd 'A-Za-z0-9._-'; }
+
+# The clock, injectable for the same reason the tab's is: a machine restored
+# from a commit has no idea what time it is, and a test that waited fifteen
+# minutes for a device code to expire is a test nobody runs.
+now() { if [ -f "$IDP/now" ]; then cat "$IDP/now"; else date +%s; fi; }
+
+# GitHub answers form-encoded unless it is asked for JSON. A client that forgets
+# the Accept header gets a body its JSON.parse cannot read, which is a real
+# failure and a quiet one, so it is reproduced rather than smoothed over.
+wants_json() { case "$HTTP_ACCEPT" in *application/json*) return 0 ;; esac; return 1; }
+
+# These two are numbers in GitHub's JSON. Everything else is a string, and the
+# list is spelled out rather than guessed from the value because a user code of
+# all digits would otherwise turn into one.
+numeric() { case "$1" in expires_in|interval) return 0 ;; esac; return 1; }
+
+# Answer with key=value pairs in whichever encoding was asked for.
+#
+# Every value here is a token, a code, an error name or a number -- none of them
+# carry a quote or a backslash -- so JSON is assembled by hand rather than by a
+# library this machine has not got.
+reply() {
+  status=$1
+  shift
+  echo "Status: $status"
+  echo "Cache-Control: no-store"
+  if wants_json; then
+    echo "Content-Type: application/json"
+    echo
+    out=
+    for pair in "$@"; do
+      k=\${pair%%=*}
+      v=\${pair#*=}
+      [ -n "$out" ] && out="$out,"
+      if numeric "$k"; then out="$out\\"$k\\":$v"; else out="$out\\"$k\\":\\"$v\\""; fi
+    done
+    printf '{%s}\\n' "$out"
+  else
+    echo "Content-Type: application/x-www-form-urlencoded"
+    echo
+    out=
+    for pair in "$@"; do
+      k=\${pair%%=*}
+      v=\${pair#*=}
+      [ -n "$out" ] && out="$out&"
+      out="$out$k=$(enc "$v")"
+    done
+    printf '%s\\n' "$out"
+  fi
+  exit 0
+}
+
+# A client id names a file. Its secret and its callbacks are lines in it, and
+# \`device=off\` is how an app with the device flow left unchecked is spelled --
+# the first wall anyone setting this up walks into.
+client_file() { echo "$IDP/gh-clients/$1"; }
+client_field() { grep "^$2=" "$(client_file "$1")" 2>/dev/null | head -n 1 | cut -d= -f2-; }
+
+# 40 hex characters, which is the shape GitHub's device code has. \`od\` gives an
+# exact length; base64 filtered down to hex characters does not.
+hex40() { od -An -tx1 -N20 /dev/urandom | tr -d ' \\n'; }
+
+# --- the device flow --------------------------------------------------------
+
+if [ "$route" = "/login/device/code" ]; then
+  client_id=$(safe "$(decode "$(field client_id)")")
+  scope=$(decode "$(field scope)")
+
+  [ -n "$client_id" ] || reply "200 OK" "error=invalid_request" \\
+    "error_description=client_id is required"
+  # GitHub answers an unknown client id with a bare "Not Found" and no
+  # description at all. device-flow.js turns that into a sentence, and this is
+  # what makes that path real rather than asserted.
+  [ -f "$(client_file "$client_id")" ] || reply "404 Not Found" "error=Not Found"
+  [ "$(client_field "$client_id" device)" != "off" ] || reply "200 OK" \\
+    "error=device_flow_disabled" \\
+    "error_description=The device flow is not enabled for this app"
+
+  device_code=$(hex40)
+  raw=$(tr -dc 'A-Z0-9' < /dev/urandom | head -c 8)
+  user_code="$(printf '%s' "$raw" | cut -c1-4)-$(printf '%s' "$raw" | cut -c5-8)"
+  started=$(now)
+
+  {
+    echo "client_id=$client_id"
+    echo "user_code=$user_code"
+    echo "state=pending"
+    echo "scope=$scope"
+    echo "interval=5"
+    echo "expires=$(( started + 900 ))"
+    echo "next=$(( started + 5 ))"
+  } > "$DEV/$device_code"
+  # The user code is what a person types, so it needs to lead back to the
+  # record. A second file rather than a scan of the first: a directory left
+  # holding yesterday's codes should not make today's sign-in slower.
+  echo "$device_code" > "$DEV/user-$user_code"
+
+  # Where to send the person. A real GitHub names itself here, so this does
+  # too: the address it was reached on is the only one that can finish the
+  # flow, and answering github.com would send a tester to a site that has
+  # never heard of the code it just issued. SCRIPT_NAME carries the /cgi-bin
+  # prefix when a guest is serving this and is empty when it sits at a root.
+  # Without a Host at all -- run from a shell rather than a server -- the
+  # honest answer is the address this shape was copied from.
+  if [ -n "$HTTP_HOST" ]; then
+    verification="http://$HTTP_HOST$SCRIPT_NAME/login/device"
+  else
+    verification="https://github.com/login/device"
+  fi
+
+  reply "200 OK" "device_code=$device_code" "user_code=$user_code" \\
+    "verification_uri=$verification" \\
+    "expires_in=900" "interval=5"
+fi
+
+# Where a person types the code. Also the lever a test pulls instead of typing
+# one: \`outcome=approve\`, \`deny\`, or \`expire\` for a code that has aged out.
+if [ "$route" = "/login/device" ]; then
+  user_code=$(safe "$(decode "$(field user_code)")")
+  outcome=$(safe "$(decode "$(field outcome)")")
+  user=$(safe "$(decode "$(field user)")")
+  [ -n "$user" ] || user=alice
+
+  if [ -z "$user_code" ]; then
+    echo "Status: 200 OK"
+    echo "Content-Type: text/html; charset=utf-8"
+    echo "Cache-Control: no-store"
+    echo
+    echo "<!doctype html><meta charset=utf-8><title>Device activation (fake)</title>"
+    echo "<h1>Enter the code</h1>"
+    echo "<p>This is not github.com. Nothing here is a secret.</p>"
+    echo "<form method=get action=device>"
+    echo "<input name=user_code placeholder=XXXX-XXXX>"
+    echo "<input type=hidden name=outcome value=approve>"
+    echo "<button>Authorize</button></form>"
+    exit 0
+  fi
+
+  index="$DEV/user-$user_code"
+  [ -f "$index" ] || reply "404 Not Found" "error=Not Found" \\
+    "error_description=no pending device code with that user code"
+  device_code=$(cat "$index")
+  record="$DEV/$device_code"
+  [ -f "$record" ] || reply "404 Not Found" "error=Not Found" \\
+    "error_description=that code has already been spent"
+
+  case "$outcome" in
+    deny)   sed -e 's/^state=.*/state=denied/' "$record" > "$record.new" ;;
+    expire) sed -e "s/^expires=.*/expires=$(( $(now) - 1 ))/" "$record" > "$record.new" ;;
+    *)      sed -e 's/^state=.*/state=approved/' "$record" > "$record.new"
+            echo "sub=$user" >> "$record.new" ;;
+  esac
+  mv "$record.new" "$record"
+
+  if wants_json; then
+    reply "200 OK" "user_code=$user_code" "outcome=\${outcome:-approve}" "user=$user"
+  fi
+  echo "Status: 200 OK"
+  echo "Content-Type: text/html; charset=utf-8"
+  echo
+  echo "<!doctype html><meta charset=utf-8><p>$(esc "$user_code"): \${outcome:-approve}."
+  exit 0
+fi
+
+# --- the web flow, which is where a client secret starts mattering ----------
+
+if [ "$route" = "/login/oauth/authorize" ]; then
+  client_id=$(safe "$(decode "$(field client_id)")")
+  redirect_uri=$(decode "$(field redirect_uri)")
+  state=$(decode "$(field state)")
+  scope=$(decode "$(field scope)")
+  challenge=$(decode "$(field code_challenge)")
+  user=$(safe "$(decode "$(field user)")")
+  [ -n "$user" ] || user=alice
+
+  fail_html() {
+    echo "Status: 400 Bad Request"
+    echo "Content-Type: text/plain; charset=utf-8"
+    echo
+    echo "$1"
+    exit 0
+  }
+
+  [ -f "$(client_file "$client_id")" ] || fail_html "no such client: $client_id"
+  # Matched whole against the registered list, which is the check that stops a
+  # code being handed to an address the app never claimed.
+  grep -qxF "callback=$redirect_uri" "$(client_file "$client_id")" \\
+    || fail_html "redirect_uri is not registered for $client_id"
+
+  code=$(hex40)
+  {
+    echo "client_id=$client_id"
+    echo "redirect_uri=$redirect_uri"
+    echo "sub=$user"
+    echo "scope=$scope"
+    echo "challenge=$challenge"
+    echo "expires=$(( $(now) + 600 ))"
+  } > "$GHC/$code"
+
+  sep='?'
+  case "$redirect_uri" in *\\?*) sep='&' ;; esac
+  location="$redirect_uri$sep""code=$code"
+  [ -n "$state" ] && location="$location&state=$(enc "$state")"
+
+  # The location goes in the body as well as the header, for the reason the
+  # authorize endpoint beside this one gives: a caller that cannot see a 302
+  # can still see where it was meant to go.
+  echo "Status: 302 Found"
+  echo "Location: $location"
+  echo "Content-Type: text/plain; charset=utf-8"
+  echo "Cache-Control: no-store"
+  echo
+  echo "$location"
+  exit 0
+fi
+
+# --- the token endpoint, which both flows end at ----------------------------
+#
+# Every answer here is a 200, including the refusals. That is GitHub's, not a
+# shortcut: \`incorrect_client_credentials\` arrives with a 200 and an error body,
+# and a client that switched on the status code would read it as success.
+
+if [ "$route" = "/login/oauth/access_token" ]; then
+  grant=$(decode "$(field grant_type)")
+  client_id=$(safe "$(decode "$(field client_id)")")
+
+  if [ "$grant" = "urn:ietf:params:oauth:grant-type:device_code" ]; then
+    device_code=$(safe "$(decode "$(field device_code)")")
+    record="$DEV/$device_code"
+    [ -f "$record" ] || reply "200 OK" "error=incorrect_device_code" \\
+      "error_description=the device code is not one this issued, or it has been spent"
+
+    saved=$(cat "$record")
+    get() { echo "$saved" | grep "^$1=" | head -n 1 | cut -d= -f2-; }
+    forget() { rm -f "$record" "$DEV/user-$(get user_code)"; }
+
+    [ "$(get client_id)" = "$client_id" ] || reply "200 OK" \\
+      "error=incorrect_client_credentials" \\
+      "error_description=The client_id passed is not the one this code was issued to"
+
+    at=$(now)
+    # Expiry first: a code past its life is expired whatever else is true of it.
+    if [ "$at" -gt "$(get expires)" ]; then
+      forget
+      reply "200 OK" "error=expired_token" \\
+        "error_description=this device code has expired"
+    fi
+    # Polling faster than the interval earns a slow_down and a wider interval.
+    # A client that honours the interval never sees this, which is exactly what
+    # makes it worth answering: it is how a client that stops honouring it gets
+    # caught.
+    if [ "$at" -lt "$(get next)" ]; then
+      widened=$(( $(get interval) + 5 ))
+      sed -e "s/^interval=.*/interval=$widened/" -e "s/^next=.*/next=$(( at + widened ))/" \\
+        "$record" > "$record.new"
+      mv "$record.new" "$record"
+      reply "200 OK" "error=slow_down" "interval=$widened"
+    fi
+
+    case "$(get state)" in
+      denied)
+        forget
+        reply "200 OK" "error=access_denied" \\
+          "error_description=the user cancelled this sign-in"
+        ;;
+      approved)
+        forget
+        # A GitHub App's user token. Opaque, and handed out exactly once,
+        # because the record is gone before this line answers.
+        reply "200 OK" "access_token=ghu_$(hex40)" "token_type=bearer" \\
+          "scope=$(get scope)"
+        ;;
+      *)
+        sed -e "s/^next=.*/next=$(( at + $(get interval) ))/" "$record" > "$record.new"
+        mv "$record.new" "$record"
+        reply "200 OK" "error=authorization_pending" \\
+          "error_description=the user has not entered the code yet"
+        ;;
+    esac
+  fi
+
+  if [ "$grant" = "authorization_code" ]; then
+    code=$(safe "$(decode "$(field code)")")
+    secret=$(decode "$(field client_secret)")
+    redirect_uri=$(decode "$(field redirect_uri)")
+    verifier=$(decode "$(field code_verifier)")
+
+    # The whole reason the web flow needs somewhere to run. GitHub rejects this
+    # exchange without the secret even when PKCE is used -- measured, not
+    # assumed -- so a client that hopes to be a public client meets the same
+    # answer here that it would meet there.
+    [ -n "$secret" ] || reply "200 OK" "error=incorrect_client_credentials" \\
+      "error_description=The client_id and/or client_secret passed are incorrect."
+    [ "$secret" = "$(client_field "$client_id" secret)" ] || reply "200 OK" \\
+      "error=incorrect_client_credentials" \\
+      "error_description=The client_id and/or client_secret passed are incorrect."
+
+    record="$GHC/$code"
+    [ -f "$record" ] || reply "200 OK" "error=bad_verification_code" \\
+      "error_description=The code passed is incorrect or expired."
+
+    # Read it and remove it before anything else can fail, so that a retry
+    # after an error cannot get a second token out of one code.
+    saved=$(cat "$record")
+    rm -f "$record"
+    get() { echo "$saved" | grep "^$1=" | head -n 1 | cut -d= -f2-; }
+
+    [ "$(get client_id)" = "$client_id" ] || reply "200 OK" \\
+      "error=bad_verification_code" \\
+      "error_description=this code was issued to another client"
+    [ "$(get redirect_uri)" = "$redirect_uri" ] || reply "200 OK" \\
+      "error=redirect_uri_mismatch" \\
+      "error_description=the redirect_uri does not match the one the code was issued for"
+    [ "$(now)" -le "$(get expires)" ] || reply "200 OK" \\
+      "error=bad_verification_code" "error_description=The code passed is expired."
+    # PKCE is recorded and required, and the SHA-256 is not computed here. The
+    # module this lives in already made that call for the same reason: busybox
+    # has sha256sum but no portable way to get its digest back into base64url,
+    # and whether the image carries openssl is unverified. The pair is checked
+    # where WebCrypto is -- \`verifyChallenge\` in this file, from the test.
+    if [ -n "$(get challenge)" ] && [ -z "$verifier" ]; then
+      reply "200 OK" "error=invalid_request" \\
+        "error_description=a code_verifier is required when a code_challenge was sent"
+    fi
+
+    reply "200 OK" "access_token=ghu_$(hex40)" "token_type=bearer" "scope=$(get scope)"
+  fi
+
+  reply "200 OK" "error=unsupported_grant_type" \\
+    "error_description=unsupported grant type: $grant"
+fi
+
+echo "Status: 404 Not Found"
+echo "Content-Type: text/plain; charset=utf-8"
+echo
+echo "no such endpoint: $route"
 `;

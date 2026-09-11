@@ -108,7 +108,14 @@ try {
   if (savedHost) $("hostKind").value = savedHost;
 } catch { /* storage may be unavailable */ }
 
-$("connect").addEventListener("click", async () => {
+/**
+ * Validate a token against the host and, if it can write, unlock booting.
+ *
+ * Split out of the button so that pasting a token runs it too: the token is
+ * fetched by hand from another tab, and asking someone to paste and then also
+ * press a button is one step more than the flow needs.
+ */
+async function connectRepository() {
   const token = $("token").value.trim();
   const [owner, repo] = $("repo").value.trim().split("/");
   const kind = $("hostKind").value;
@@ -152,6 +159,184 @@ $("connect").addEventListener("click", async () => {
   } catch (err) {
     status(err.message, "bad");
   }
+}
+
+$("connect").addEventListener("click", connectRepository);
+
+/**
+ * Sign in to GitHub, through the bridge.
+ *
+ * The user authenticates at github.com -- password, second factor, whatever
+ * their account requires -- and this page is handed a token. It never sees the
+ * password, and there is no token for anyone to create or paste. That is what
+ * OAuth is for, and it is why the credentials go to GitHub's own page rather
+ * than into a form here.
+ *
+ * The bridge does the one step a browser cannot. GitHub's token endpoints send
+ * no CORS headers, and a machine inherits that refusal because its only route
+ * out is this tab's `fetch`; the bridge is not a browser. The device flow is
+ * the grant with no client secret, so there is nothing to deploy and nothing to
+ * guard -- the same reason the `gh` command-line tool uses it.
+ *
+ * The token goes where a pasted one goes: the field, memory, and nowhere else.
+ * `SECURITY.md` is the reason, and a sign-in button is not an excuse to start
+ * writing it down.
+ */
+const BRIDGE = "http://localhost:9000";
+
+/**
+ * Say up front whether signing in is going to work.
+ *
+ * Finding out by pressing the button and reading a paragraph is the worst of
+ * both: it fails at the moment you had decided to do something else. This asks
+ * once, on load, and puts the answer where the decision is made.
+ *
+ * The interesting case is a page served over HTTPS -- a static host, which is
+ * where this is deployed. `http://localhost` is a trustworthy origin, so mixed
+ * content does not block it, but a public page reaching a local address is a
+ * private network request and a browser preflights it. The bridge answers that
+ * preflight; whether the browser then allows it depends on the browser. So this
+ * tries, and if it cannot get through it says which of the two situations it is
+ * in rather than "failed".
+ */
+async function checkBridge() {
+  const chip = $("bridgeState");
+  const hint = $("bridgeHint");
+  const set = (text, on, help = "") => {
+    chip.textContent = text;
+    chip.className = `mountstate${on ? " on" : ""}`;
+    hint.textContent = help;
+  };
+
+  try {
+    const response = await fetch(`${BRIDGE}/_bridge/status`, { signal: AbortSignal.timeout(2500) });
+    const status = await response.json();
+    if (status.github) {
+      set("sign-in ready", true);
+    } else {
+      set("bridge, no client id", false,
+          "The bridge is running but was started without one, so it cannot sign anyone in. " +
+          "Restart it with --github-client-id <id>, or set GITHUB_CLIENT_ID before starting it.");
+    }
+  } catch {
+    // Which of the two situations this is turns on where the page came from, not
+    // on whether it came over HTTPS. Measured: an HTTPS page on localhost reaches
+    // the bridge and signs in normally, and a page on a public host does not
+    // reach it at all -- a browser will not let a public page open a connection
+    // into the machine of the person reading it, and answering the preflight
+    // does not change that. So the address is what decides the message.
+    const local = /^(localhost|127\.|\[?::1\]?$)/.test(location.hostname);
+    if (!local) {
+      set("no bridge", false,
+          "This page is being served from " + location.hostname + ", and the bridge would run on " +
+          "the machine of whoever is reading it. A browser will not let a page on a public host " +
+          "open a connection into a reader's own machine, so this button cannot work here -- not " +
+          "because the bridge is missing, but because nothing would be allowed to reach it. Run " +
+          "the project locally to sign in this way. Everything else on this page works without it.");
+    } else {
+      set("no bridge", false,
+          "Nothing is listening at " + BRIDGE + ". Start it beside the static server with " +
+          "\"python serve.py --open --bridge\", having set GITHUB_CLIENT_ID, or run " +
+          "\"node tools/bridge.mjs --github-client-id <id>\" yourself.");
+    }
+  }
+}
+
+addEventListener("load", () => { checkBridge(); });
+
+$("ghSignIn").addEventListener("click", async () => {
+  const help = $("tokenHelp");
+  enable(["ghSignIn"], false);
+  const say = (node) => { help.textContent = ""; help.append(node); };
+  const line = (text) => { const d = document.createElement("div"); d.textContent = text; return d; };
+
+  try {
+    let started;
+    try {
+      started = await (await fetch(`${BRIDGE}/_bridge/github/start`)).json();
+    } catch {
+      say(line(
+        `Nothing is listening at ${BRIDGE}. GitHub's token endpoints refuse browsers, so this ` +
+        `needs the bridge: start it with "node tools/bridge.mjs --github-client-id <id>" and press this again.`
+      ));
+      status("the bridge is not running", "bad");
+      return;
+    }
+    if (started.error) {
+      say(line(started.detail ? `${started.error}: ${started.detail}` : started.error));
+      status(started.error, "bad");
+      return;
+    }
+
+    const panel = document.createElement("div");
+    panel.append(line("Enter this code at GitHub and sign in there. Leave this tab open:"));
+    const code = document.createElement("div");
+    code.textContent = started.userCode;
+    code.style.cssText = "font-size:22px;letter-spacing:.18em;margin:8px 0;user-select:all";
+    panel.append(code);
+    const link = document.createElement("a");
+    link.href = started.verificationUri;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.textContent = started.verificationUri;
+    panel.append(link);
+    say(panel);
+    status("Waiting for you to sign in at GitHub...", "idle");
+    window.open(started.verificationUri, "_blank", "noopener");
+
+    const every = Math.max(1, Number(started.interval) || 5) * 1000;
+    const until = Date.now() + (Number(started.expiresIn) || 900) * 1000;
+    while (Date.now() < until) {
+      await new Promise((r) => setTimeout(r, every));
+      const result = await (await fetch(
+        `${BRIDGE}/_bridge/github/poll?handle=${encodeURIComponent(started.handle)}`)).json();
+
+      if (result.status === "pending") continue;
+      if (result.status === "done") {
+        $("hostKind").value = "github";
+        $("token").value = result.token;
+        help.textContent = "Signed in as yourself at GitHub. The token is held in memory only, " +
+                           "and is written nowhere.";
+        const [owner, repo] = $("repo").value.trim().split("/");
+        if (!owner || !repo) {
+          status("Signed in. Now fill in owner / repo and press Connect.", "ok");
+          return;
+        }
+        status("Signed in. Checking what the token can reach...", "idle");
+        await connectRepository();
+        return;
+      }
+      const why = {
+        denied: "You declined it at GitHub.",
+        expired: "The code expired. Press Sign in with GitHub again.",
+        unknown: "The bridge has forgotten this sign-in. Press Sign in with GitHub again."
+      }[result.status] ||
+        `${result.error || result.status}${result.description ? ": " + result.description : ""}`;
+      help.textContent = why;
+      status(why, "bad");
+      return;
+    }
+    status("The code expired before it was entered.", "bad");
+  } finally {
+    enable(["ghSignIn"], true);
+    checkBridge();
+  }
+});
+
+// Pasting a token still connects, for GitLab and Codeberg: they have no device
+// flow here, so that field is the only way in for them.
+$("token").addEventListener("paste", () => {
+  // The field still holds the old value during the event; let the paste land.
+  setTimeout(() => {
+    if (!$("token").value.trim()) return;
+    const [owner, repo] = $("repo").value.trim().split("/");
+    if (!owner || !repo) {
+      status("Token pasted. Fill in owner / repo and press Connect.", "idle");
+      return;
+    }
+    status("Checking the token...", "idle");
+    connectRepository();
+  }, 0);
 });
 
 // --- boot ----------------------------------------------------------------------

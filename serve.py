@@ -7,6 +7,18 @@ async-buffer test needs a server that answers 206 properly.
 
     python serve.py [port ...]    default 8000 8001
     python serve.py --open        the same, and open a machine in a browser
+    python serve.py --bridge      the same, and start tools/bridge.mjs beside it
+    python serve.py --bridge --github-client-id ID    ... offering GitHub sign-in
+
+--bridge is opt-in on purpose. The bridge is a server, which the rest of this
+project is at pains not to be, and SECURITY.md's claim that it "is started by
+hand, and stops when you stop it" should stay true: a flag is a hand. What it
+removes is the second terminal, not the decision. It needs node. Give it
+--github-client-id (or set GITHUB_CLIENT_ID here) to offer GitHub sign-in; the
+id is passed on as an argument rather than through the environment, because an
+environment does not always survive a platform boundary and the failure when it
+does not is silent. --github-base moves which GitHub it signs in to, which is
+how tools/fake-github.mjs gets tested from the app.
 
 Serves the whole project so /app can import /src directly. Range support is
 required: v86's streamed disk fetches with Range, and python -m http.server
@@ -20,15 +32,46 @@ is the app, the second is where machines appear.
 """
 import http.server
 import io
+import subprocess
 import os
 import re
+import signal
 import socketserver
 import sys
 import threading
 import webbrowser
 
-ARGS = [a for a in sys.argv[1:] if a != "--open"]
-OPEN = "--open" in sys.argv[1:]
+ARGV = sys.argv[1:]
+OPEN = "--open" in ARGV
+BRIDGE = "--bridge" in ARGV
+
+
+def option(name):
+    """The value after a flag, if there is one that is not itself a flag."""
+    if name in ARGV:
+        at = ARGV.index(name)
+        if at + 1 < len(ARGV) and not ARGV[at + 1].startswith("--"):
+            return ARGV[at + 1]
+    return None
+
+
+# Passed to the bridge as an argument rather than left to the environment. An
+# environment is not always inherited across a platform boundary -- WSL forwards
+# only what WSLENV names, so a Windows node started from a Linux python sees
+# nothing -- and the failure is silent: the bridge comes up without sign-in and
+# nothing says why. An argument crosses every boundary there is.
+CLIENT_ID = option("--github-client-id") or os.environ.get("GITHUB_CLIENT_ID")
+# Where the bridge should look for GitHub. Passed on for the same reason and
+# by the same route as the client id, and the reason to want it is
+# tools/fake-github.mjs: pointed at that, the sign-in button can be pressed
+# without registering an app or typing a code into github.com.
+CLIENT_BASE = option("--github-base") or os.environ.get("GITHUB_BASE")
+
+_taken = set()
+for _flag in ("--github-client-id", "--github-base"):
+    if _flag in ARGV:
+        _taken.add(ARGV.index(_flag) + 1)
+ARGS = [a for i, a in enumerate(ARGV) if not a.startswith("--") and i not in _taken]
 PORTS = [int(a) for a in ARGS] or [8000, 8001]
 
 
@@ -107,6 +150,14 @@ class Server(socketserver.ThreadingTCPServer):
 
 if __name__ == "__main__":
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
+
+    # Ctrl-C raises KeyboardInterrupt and the cleanup below runs. A SIGTERM --
+    # from `kill`, from a supervisor, from a shell tearing down a job -- exits
+    # without unwinding, and the bridge is left holding port 9000 with nothing
+    # left that knows it started it. Turning it into SystemExit runs the same
+    # finally block that Ctrl-C does. Measured: without this, a killed serve.py
+    # orphans its bridge.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     servers = [Server(("127.0.0.1", port), RangeHandler) for port in PORTS]
 
     print("serving %s with Range support" % os.getcwd(), flush=True)
@@ -119,6 +170,26 @@ if __name__ == "__main__":
     for httpd in servers[1:]:
         threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
+    bridge = None
+    if BRIDGE:
+        # Inherit stdio: the bridge announces its own address, its token if it
+        # made one, and every request it carries. Swallowing that would make the
+        # convenience cost more than the second terminal did.
+        try:
+            command = [os.environ.get("NODE", "node"), "tools/bridge.mjs"]
+            if CLIENT_ID:
+                command += ["--github-client-id", CLIENT_ID]
+            if CLIENT_BASE:
+                command += ["--github-base", CLIENT_BASE]
+            bridge = subprocess.Popen(command)
+            print("    started tools/bridge.mjs (pid %d)" % bridge.pid, flush=True)
+        except FileNotFoundError:
+            print("    no node on PATH, so no bridge. Everything else still works;",
+                  flush=True)
+            print("    signing in to GitHub is the only thing that needs it.", flush=True)
+        except OSError as err:
+            print("    could not start the bridge: %s" % err, flush=True)
+
     if OPEN:
         # ?serve boots a machine, serves it and checks it, with nothing to type.
         start = "http://localhost:%d/app/?serve" % PORTS[0]
@@ -129,5 +200,14 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\nstopped")
     finally:
+        # The bridge outlives this process otherwise, and the next run then finds
+        # port 9000 taken by something it did not start and cannot see.
+        if bridge and bridge.poll() is None:
+            bridge.terminate()
+            try:
+                bridge.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                bridge.kill()
+            print("stopped the bridge")
         for httpd in servers:
             httpd.shutdown()

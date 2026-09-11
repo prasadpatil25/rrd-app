@@ -120,18 +120,29 @@ disk, not a synthetic workload.
 ```
 for t in test test-engine test-device test-fs test-runner test-terminal \
          test-keyboard test-alpine test-sweep test-bisect test-nbd test-batch \
-         test-net test-publish test-lease test-gateway test-idp; do
+         test-net test-publish test-lease test-gateway test-idp test-device-flow \
+         test-fake-github; do
   node src/$t.mjs
 done
 ```
 
-966 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
+1056 assertions. They need no network and no credentials. `test-nbd.mjs` speaks
 the client half of the NBD protocol over a real socket, so the wire format and
 the server loop are exercised rather than mocked; the one hop that needs Linux
 is `nbd-client` binding the export to `/dev/nbd0`. `test-net.mjs` does the same
 for the network: the stack is driven by a guest that speaks the server half of
 TCP over real frames, and the HTTP parser is fed the bytes of a real Node HTTP
 server over a real socket.
+
+`test-fake-github.mjs` does it for signing in. GitHub's endpoints are a shell
+script in `app/idp.js`, because where they belong is busybox httpd inside a
+guest -- so the suite runs that script, byte for byte, behind a Node server and
+points the real `DeviceLogin` at it over real HTTP. That reaches what an
+injected `fetch` cannot: GitHub answers a refused token request with a 200 and
+an error body, and it answers form-encoded unless asked for JSON, and a client
+that got either wrong would pass every test in `test-device-flow.mjs` and fail
+against github.com. It needs a POSIX shell with awk, and skips with a reason
+rather than a failure when there is none.
 
 ## Before you run anything that takes a token
 
@@ -151,6 +162,106 @@ GITLAB_TOKEN=... node src/analysis/batch-commit.mjs gitlab owner/repo
 
 Use a fine-grained token scoped to the one repository, with the shortest expiry
 your workflow tolerates. Rotation is the only revocation this design offers.
+
+In the app, **Sign in with GitHub** signs you in with your GitHub account: the
+panel shows a short code, you enter it at `github.com/login/device` and
+authenticate there with your password and second factor, and the page is handed
+a token. It never sees your password, and there is no token for you to create or
+paste.
+
+It runs GitHub's device flow through `tools/bridge.mjs`, and that is where the
+constraint bites. GitHub's token endpoints send no `Access-Control-Allow-Origin`
+-- which is how a browser is kept out of OAuth secrets -- so no page can
+exchange anything for a token, and no machine can either: every route out of a
+guest ends at the tab's own `fetch`, and inherits the same refusal. The bridge is
+not a browser, so it can. Start it with `--github-client-id <id>`, having
+registered a GitHub App, enabled its device flow and installed it on the one
+repository this machine uses.
+
+The device flow is the OAuth grant designed for a client that cannot keep a
+secret: **there is no client secret at all**, so nothing has to be deployed and
+nothing has to be guarded. That is the same reason the `gh` command-line tool
+uses it rather than shipping a secret to every machine, and the price is the one
+code you type. The token comes back once, is held in the page's memory, and is
+written nowhere.
+
+Starting it is one command, not two:
+
+```
+python serve.py --open --bridge --github-client-id Iv1.xxxx
+```
+
+`--bridge` starts `tools/bridge.mjs` beside the static server, passes the client
+id on as an argument (`GITHUB_CLIENT_ID` in the environment works too, and is
+read here rather than left for the bridge to find -- an environment does not
+always survive a platform boundary, and when it does not the bridge comes up
+without sign-in and nothing says why), passes its output through,
+and stops it on the way out -- a bridge left running is a port the next run
+finds taken by something it did not start. It is a flag rather than the default
+because `SECURITY.md` says the bridge "is started by hand, and stops when you
+stop it", and that should stay true; what the flag removes is the second
+terminal, not the decision. Without node it says so and serves anyway.
+
+**The Repository panel says up front whether this will work**, rather than
+letting you find out by pressing the button: *sign-in ready*, *bridge, no client
+id*, or *no bridge* with the command to run.
+
+**Trying it without GitHub.** Registering an app, ticking the device flow box
+and typing a code into github.com is a lot of setup to walk through before
+finding out whether the button works, and none of it can be repeated on demand:
+a real device code takes fifteen minutes to expire, and there is no way to ask
+github.com to refuse one. So the endpoints exist as a fake, in `app/idp.js`
+beside the test IdP and installed onto the same disk:
+
+```
+node tools/fake-github.mjs --port 9100
+python serve.py --open --bridge --github-client-id Iv1.test-client-do-not-trust \
+                --github-base http://127.0.0.1:9100
+```
+
+The panel says *sign-in ready*, and **Sign in with GitHub** shows a code and a
+link beside it. The link is the fake, not github.com -- a device flow names the
+address that can finish it, and sending a tester to a site that never heard of
+their code would be the one answer no real GitHub ever gives. Click it, press
+Authorize, and the panel has a token. Nothing reaches github.com.
+
+`--github-base` is passed on to the bridge the same way `--github-client-id` is,
+and for the same reason. Or run the bridge yourself and skip `--bridge`:
+
+```
+node tools/bridge.mjs --github-client-id Iv1.test-client-do-not-trust \
+                      --github-base http://127.0.0.1:9100
+```
+
+Either way the code can also be entered with a request rather than a person,
+which is what a test does:
+
+```
+curl "http://127.0.0.1:9100/login/device?user_code=XXXX-XXXX&outcome=approve"
+```
+
+`outcome=deny` and `outcome=expire` are the other two answers, which is the
+part a real GitHub cannot be asked for. `--github-base` was already there for
+Enterprise; this is the same seam. The client secret in the fixtures is
+published, like the IdP's signing key beside it, and for the same reason: a fake
+GitHub has nothing to protect, and a token it issues means nothing anywhere.
+
+**It does not work on a static host, and that is not fixable here.** Measured
+against the real deployment rather than assumed: a page on
+`https://prasadpatil25.github.io` cannot open a connection to `http://localhost`
+at all -- `TypeError: Failed to fetch` -- because a browser will not let a page
+on a public host reach into the machine of the person reading it. Answering the
+private-network preflight, which the bridge does, changes nothing. What was
+measured to work is a page served over HTTPS from localhost, which signs in
+normally; so HTTPS is not the obstacle and the address is. Deployed, the panel
+says so in those words. A visitor to a static host would need a small always-on
+service holding a client secret -- a server, and there is not one here.
+Everything else on the page works without it.
+
+The token field beside it is the way in for GitLab and Codeberg, which have no
+device flow here. Paste one and it validates itself. Note that only GitHub can
+narrow a token to a single repository; on the other two it reaches the whole
+account.
 
 ## Whose repository, for real use
 
@@ -559,6 +670,13 @@ second one is not optional:
 node tools/bridge.mjs 9000 --host 0.0.0.0 --token <secret>
 ```
 
+`--github-client-id <id>` is separate and unrelated to reachability: it lets the
+bridge run GitHub's device flow on the app's behalf, which no page can do for
+itself. `--github-scope` sets a scope for an OAuth App (a GitHub App takes its
+permissions from the app and ignores it), and `--github-base` points at an
+Enterprise host. There is no client secret in a device flow, so the bridge
+stores nothing; `SECURITY.md` says what it does change.
+
 `--host` binds beyond loopback so a phone or a laptop on the same network can
 reach the machine. Off loopback the bridge **refuses to start without a token**;
 omit `--token` and it generates one and prints it rather than coming up open.
@@ -923,6 +1041,7 @@ still writing to.
 src/core/       the sync engine: chunker, manifest, governor, machine, bisect
 src/device/     the five-operation device contract, and its three implementations
 src/host/       GitHub, GitLab and Forgejo adapters behind one interface
+src/host/device-flow.js  GitHub's device flow, for the bridge to run on a page's behalf
 src/guest/      driving a guest shell: exit codes, mounts, Alpine, apk
 guest/          the machine's kernel and initramfs, and the script that builds it
 src/net/        the tab's TCP/IP stack: wire format, connections, HTTP

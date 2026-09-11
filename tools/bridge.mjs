@@ -30,9 +30,11 @@
 // build step to install it would cost more than the polling does.
 //
 //   node tools/bridge.mjs [port] [--host addr] [--token secret]   port 9000
+//   ... [--github-client-id id] [--github-scope s]   to offer GitHub sign-in
 
 import http from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { DeviceLogin } from "../src/host/device-flow.js";
 
 const args = process.argv.slice(2);
 const flag = (name) => {
@@ -55,6 +57,25 @@ const LOOPBACK = ["127.0.0.1", "::1", "localhost", null];
  */
 const asked = flag("--token");
 const TOKEN = asked || (LOOPBACK.includes(HOST) ? null : randomBytes(16).toString("hex"));
+/**
+ * Signing in to GitHub, for a page that cannot.
+ *
+ * GitHub's token endpoints send no CORS headers, so no browser -- and no guest
+ * behind one, since every route out of a machine ends at the tab's own `fetch`
+ * -- can exchange anything for a token. This process is not a browser, so it
+ * can. The device flow is the grant that needs no client secret, which is what
+ * makes it fit here: there is nothing to deploy and nothing to keep.
+ *
+ * Off by default. Without a client id the endpoints below say what to register
+ * rather than half-existing.
+ */
+const GITHUB_CLIENT_ID = flag("--github-client-id") || process.env.GITHUB_CLIENT_ID || null;
+const GITHUB_SCOPE = flag("--github-scope") || process.env.GITHUB_SCOPE || "";
+const GITHUB_BASE = flag("--github-base") || process.env.GITHUB_BASE || "https://github.com";
+const signIn = GITHUB_CLIENT_ID
+  ? new DeviceLogin({ clientId: GITHUB_CLIENT_ID, scope: GITHUB_SCOPE, base: GITHUB_BASE })
+  : null;
+
 const HOLD_MS = 25000;      // how long a poll waits before answering "nothing yet"
 const ANSWER_MS = 60000;    // how long a caller waits for the machine to answer
 
@@ -157,14 +178,28 @@ async function handle(request, response) {
   const machine = url.searchParams.get("machine") || "1";
 
   if (request.method === "OPTIONS") {
-    response.writeHead(204, {
+    const headers = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
       "Access-Control-Allow-Headers": "content-type",
       // So a preflight, if one happens at all, happens once rather than per
       // request.
       "Access-Control-Max-Age": "86400"
-    });
+    };
+    // A request that crosses into a narrower address space is preflighted even
+    // when the request itself is simple, and the browser asks with this header.
+    // Answering it is the correct thing to do and costs nothing.
+    //
+    // It does not make a deployed page work, and it was worth measuring rather
+    // than assuming: a page on a genuinely public origin -- the real
+    // prasadpatil25.github.io, not a local stand-in -- cannot reach loopback at
+    // all, header or no header. What this does cover is a caller the browser is
+    // willing to let through, such as a page served over HTTPS from localhost,
+    // which was measured to sign in normally.
+    if (request.headers["access-control-request-private-network"] === "true") {
+      headers["Access-Control-Allow-Private-Network"] = "true";
+    }
+    response.writeHead(204, headers);
     return response.end();
   }
 
@@ -212,11 +247,53 @@ async function handle(request, response) {
 
   if (url.pathname === "/_bridge/status") {
     return send(response, 200, {
+      // So the app can say "ready" or "running, but started without a client
+      // id" rather than making someone press the button to find out which.
+      github: Boolean(signIn),
       machines: [...new Set([...waiting.keys(), ...pollers.keys()])],
       waiting: [...waiting.entries()].map(([m, q]) => ({ machine: m, queued: q.length })),
       listening: [...pollers.entries()].map(([m, p]) => ({ machine: m, polls: p.length })),
       inFlight: inFlight.size
     });
+  }
+
+  // --- signing in to GitHub, which a page cannot do for itself ---------------
+
+  if (url.pathname.startsWith("/_bridge/github/")) {
+    if (!signIn) {
+      return send(response, 501, {
+        error: "not configured",
+        detail: "Start the bridge with --github-client-id <id> (or GITHUB_CLIENT_ID). " +
+                "Register a GitHub App, enable its device flow, and install it on the one " +
+                "repository this machine uses. A device flow has no client secret, so there " +
+                "is nothing here to keep."
+      });
+    }
+
+    if (url.pathname === "/_bridge/github/start") {
+      try {
+        const started = await signIn.start();
+        console.log(`github: waiting for ${started.userCode} to be entered at ${started.verificationUri}`);
+        return send(response, 200, started);
+      } catch (err) {
+        console.log(`github: ${err.message}`);
+        return send(response, 502, { error: err.message });
+      }
+    }
+
+    if (url.pathname === "/_bridge/github/poll") {
+      const handle = url.searchParams.get("handle") || "";
+      try {
+        const result = await signIn.poll(handle);
+        // The token crosses this log's path, so the log gets the status only.
+        if (result.status !== "pending") console.log(`github: ${result.status}`);
+        return send(response, 200, result);
+      } catch (err) {
+        return send(response, 502, { error: err.message });
+      }
+    }
+
+    return send(response, 404, { error: `no such endpoint: ${url.pathname}` });
   }
 
   // --- everything else is for the machine ------------------------------------
@@ -316,6 +393,11 @@ function announce() {
     // it says so here rather than discovering it afterwards.
     console.log(`  no token: on loopback, that is the trust you give any dev server.`);
     console.log(`  Putting a tunnel in front of this makes it public -- restart with --token first.`);
+  }
+  if (signIn) {
+    console.log(`  github sign-in is on, client ${GITHUB_CLIENT_ID}` +
+                `${GITHUB_SCOPE ? `, scope ${GITHUB_SCOPE}` : ""}.`);
+    console.log(`  The Repository panel can use it; a device flow has no secret to leak.`);
   }
   console.log(`  waiting for a tab. In the app's console:\n`);
   console.log(`    const b = await import("./bridge-client.js");`);

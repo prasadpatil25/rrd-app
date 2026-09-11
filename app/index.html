@@ -224,8 +224,17 @@ code { background: var(--code-bg); padding: .1em .35em; border-radius: 3px; }
     </div>
     <div class="f"><label for="token">Token</label><input type="password" id="token" autocomplete="off" spellcheck="false" placeholder="github_pat_..."></div>
     <div class="f"><label for="repo">Owner / repo</label><input type="text" id="repo" spellcheck="false" placeholder="you/scratch"></div>
+    <button class="ghost" id="ghSignIn">Sign in with GitHub</button>
     <button id="connect">Connect</button>
+    <span class="mountstate" id="bridgeState">checking</span>
   </div>
+  <p class="hint" id="tokenHelp"><strong>Sign in with GitHub</strong> signs you in with your GitHub account:
+  you enter a short code at github.com and authenticate there, with your password and second factor, and this
+  page is handed a token. It never sees your password, and there is no token for you to create or paste.
+  It needs <code>node tools/bridge.mjs --github-client-id &lt;id&gt;</code> running, because GitHub&rsquo;s token
+  endpoints refuse browsers outright and a machine inherits that &mdash; its only way out is this tab&rsquo;s own
+  <code>fetch</code>. The token field is still there for GitLab and Codeberg, which have no such flow here.</p>
+  <p class="hint" id="bridgeHint"></p>
   <p class="status idle" id="status">Not connected.</p>
 </section>
 

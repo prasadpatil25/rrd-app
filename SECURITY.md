@@ -153,6 +153,28 @@ in it, and it travels in the URL when it is on the query string, so it lands in
 proxy logs and browser history. It is the difference between exposed and
 exposed-to-anyone, not between exposed and safe.
 
+**Signing in to GitHub through it.** Started with `--github-client-id`, the
+bridge will run GitHub's device flow, which a browser cannot: GitHub's token
+endpoints send no CORS headers, and a guest inherits that wall because its only
+route out is the tab's own `fetch`. A device flow carries **no client secret**,
+so nothing new is stored and nothing new can leak from the bridge at rest. What
+does change is that a process which can reach loopback can now ask for a
+sign-in. It cannot complete one: only the person at github.com can authorise a
+code. What it could do is race for the result, so the handle is sixteen random
+bytes and the token is handed out exactly once and forgotten in the same breath
+-- a second poll on the same handle gets nothing. The token never reaches the
+bridge's log, which prints the status and not the answer. It is held in the
+page, in memory, exactly where a pasted one is held, and the flag is off unless
+given. `python serve.py --bridge` starts one for you and stops it again, and is
+a flag rather than the default so that "started by hand" stays true.
+
+None of this reaches a deployed page, and that was measured rather than assumed:
+a page on the real static host cannot open a connection to loopback at all, so a
+bridge on a reader's machine is not something a published page can quietly talk
+to. Answering the private-network preflight, which the bridge does, does not
+change it. That is the browser's boundary rather than this project's, and it is
+one worth having.
+
 The public case adds a third party. A tunnel (`cloudflared tunnel --url
 http://localhost:9000`) gives a public HTTPS URL without opening a port on the
 router, and in exchange **the tunnel operator terminates the TLS and sees every

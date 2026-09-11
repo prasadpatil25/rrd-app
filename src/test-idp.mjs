@@ -469,6 +469,21 @@ function recorder({ indexExists }) {
          rec.commands.some((c) => c.includes("> /disk/idp/www/index.html")));
   check_("and the CGI is made executable",
          rec.commands.includes("chmod +x /disk/idp/www/cgi-bin/authorize"));
+
+  // The fake GitHub travels with the IdP: same disk, same install, same commit.
+  // Its apps are written down rather than computed, because a bridge is reached
+  // at a port and not at an address only the runtime knows.
+  eq("it reports where the GitHub endpoints went", where.github,
+     "/disk/idp/www/cgi-bin/github");
+  check_("and installs them",
+         rec.commands.includes("chmod +x /disk/idp/www/cgi-bin/github"));
+  const app = rec.writtenTo("/disk/idp/gh-clients/Iv1.test-client-do-not-trust");
+  check_("an app with the device flow enabled is on the disk",
+         app.includes("device=on"), app);
+  check_("carrying the secret that protects nothing", app.includes("secret="), app);
+  const unticked = rec.writtenTo("/disk/idp/gh-clients/Iv1.no-device-flow");
+  check_("and one with it unticked, which is the wall people hit",
+         unticked.includes("device=off"), unticked);
 }
 {
   // The rule the Serve button follows, and the reason the button can install
