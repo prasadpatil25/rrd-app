@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Texbranch has moved</title>
+<script>
+  // /rrd-app/<path> goes to /texbranch/<path>, its query and fragment kept.
+  var rest = location.pathname.replace(/^\/rrd-app/, "");
+  location.replace("/texbranch" + (rest || "/") + location.search + location.hash);
+</script>
+<noscript><meta http-equiv="refresh" content="0; url=/texbranch/"></noscript>
+<body style="font: 16px system-ui, sans-serif; margin: 3rem 1rem; text-align: center">
+<p>This app is now Texbranch, at <a href="/texbranch/">prasadpatil25.github.io/texbranch</a>.</p>
+</body>
+</html>
